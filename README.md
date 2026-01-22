@@ -128,6 +128,25 @@ MAX_WORKERS=20
 CHUNK_SIZE=500000
 ```
 
+## Quick Start
+
+For a complete step-by-step guide, see [QUICKSTART.md](QUICKSTART.md).
+
+**Minimal example** (with mock databases for testing):
+
+```bash
+# 1. Install and configure
+pip install -e .
+cp .env.example .env
+# Edit .env with your settings
+
+# 2. Extract and convert schema
+python -m src.schema --full
+
+# 3. Run migration
+python -m src --tables PS_XLATTABLE  # Start with small table
+```
+
 ## Usage
 
 ### Phase 1: Schema Extraction and Conversion
@@ -135,17 +154,43 @@ CHUNK_SIZE=500000
 Extract PeopleSoft schema from DB2 catalog tables and convert to PostgreSQL DDL:
 
 ```bash
+# Option 1: All-in-one command (extract + convert)
+python -m src.schema --full
+
+# Option 2: Step-by-step
 # Extract schema from PeopleSoft catalog
-python -m src.schema.extractor --output schema/extracted/
+python -m src.schema extract --output schema/extracted/
 
 # Convert to PostgreSQL DDL
-python -m src.schema.converter --input schema/extracted/ --output schema/postgres/
+python -m src.schema convert --input schema/extracted/ --output schema/postgres/
 
 # Review generated DDL
 cat schema/postgres/all_tables.sql
+cat schema/postgres/tables/PS_VOUCHER.sql
 
 # Apply DDL to PostgreSQL
 psql -h localhost -d ps82_archive -f schema/postgres/all_tables.sql
+```
+
+**Example output** from schema extraction:
+
+```
+Extracting PeopleSoft Schema
+========================================
+Connected to DB2: PROD_PS82
+Querying PSRECDEFN...
+Found 1,847 tables
+
+Extracting table definitions:
+[1/1847] PS_XLATTABLE (500 rows estimated)
+[2/1847] PS_INSTALLATION (1 row estimated)
+[3/1847] PS_VOUCHER (5,000,000 rows estimated)
+...
+
+Schema extracted to: schema/extracted/
+Converting to PostgreSQL DDL...
+Generated: schema/postgres/all_tables.sql (1,847 tables)
+Generated: schema/postgres/all_indexes.sql (4,523 indexes)
 ```
 
 ### Phase 2: Data Migration
@@ -154,13 +199,16 @@ Run the full migration with dynamic parallelism:
 
 ```bash
 # Full migration (all tables)
-python -m src.orchestrator
+python -m src
 
 # Migrate specific tables only
-python -m src.orchestrator --tables PS_VOUCHER,PS_VCHR_LINE,PS_PAYMENT_TBL
+python -m src --tables PS_VOUCHER,PS_VCHR_LINE,PS_PAYMENT_TBL
 
 # Resume from checkpoint after interruption
-python -m src.orchestrator --resume
+python -m src --resume
+
+# Fixed worker count (disable dynamic parallelism)
+python -m src --min-workers 5 --max-workers 5
 ```
 
 Progress display during migration:
@@ -170,10 +218,15 @@ Progress display during migration:
 │ PS82 to PostgreSQL Migration                            │
 ├─────────────────────────────────────────────────────────┤
 │ Progress: 234/1,847 tables (12.7%)                      │
-│ Workers: 8 active (target: 10, CPU: 72%, Mem: 45%)     │
-│ Current: PS_VOUCHER (chunk 5/12), PS_JRNL_HEADER...    │
-│ Rate: 125,000 rows/sec | ETA: 4h 23m                   │
+│ Workers: 8 active                                       │
+│ CPU: 72.5%                                              │
+│ Memory: 45.2%                                           │
+│ Total Rows: 125,430,500                                 │
 └─────────────────────────────────────────────────────────┘
+
+[10:15:23] table_completed table=PS_VOUCHER rows=5000000 duration=182.5s worker=3
+[10:16:45] table_completed table=PS_VCHR_LINE rows=15000000 duration=425.2s worker=5
+[10:17:12] chunk_completed table=PS_JRNL_LN chunk=8/15 rows=500000 worker=2
 ```
 
 ### Phase 3: Validation
@@ -182,13 +235,426 @@ Validate data integrity after migration:
 
 ```bash
 # Fast validation: row count comparison
-python -m src.loading.validator --mode counts
+python -m src.loading validate --mode counts
 
 # Thorough validation: sample-based checksums
-python -m src.loading.validator --mode checksums --sample-rate 0.01
+python -m src.loading validate --mode checksums --sample-rate 0.01
 
 # Validate specific tables
-python -m src.loading.validator --mode counts --tables PS_VOUCHER,PS_VCHR_LINE
+python -m src.loading validate --mode counts --tables PS_VOUCHER,PS_VCHR_LINE
+```
+
+**Example validation output:**
+
+```
+Validating Migration
+========================================
+Mode: counts
+Tables: 1,847
+
+[✓] PS_XLATTABLE: 500 rows (DB2: 500, PG: 500)
+[✓] PS_VOUCHER: 5,000,000 rows (DB2: 5,000,000, PG: 5,000,000)
+[✗] PS_JRNL_LN: MISMATCH (DB2: 25,000,000, PG: 24,999,950)
+[✓] PS_VCHR_LINE: 15,000,000 rows (DB2: 15,000,000, PG: 15,000,000)
+
+Summary:
+  Total: 1,847 tables
+  Passed: 1,846 (99.9%)
+  Failed: 1 (0.1%)
+
+Check logs/migration.log for details on failures.
+```
+
+## Example Scenarios
+
+### Scenario 1: Migrate a Small Table
+
+Test the tool with a small translate table:
+
+```bash
+# 1. Extract schema for specific table
+python -m src.schema extract --tables PS_XLATTABLE
+
+# 2. Apply DDL
+psql -h localhost -d ps82_archive -f schema/postgres/tables/PS_XLATTABLE.sql
+
+# 3. Migrate data
+python -m src --tables PS_XLATTABLE
+
+# Expected output:
+# Building work queue...
+# Total tables: 1
+# Starting migration with 2 workers...
+# [10:30:15] table_completed table=PS_XLATTABLE rows=500 duration=0.8s worker=0
+# Migration complete: 1/1 tables (100%)
+
+# 4. Validate
+python -m src.loading validate --mode counts --tables PS_XLATTABLE
+
+# Expected output:
+# [✓] PS_XLATTABLE: 500 rows (DB2: 500, PG: 500)
+```
+
+### Scenario 2: Migrate a Large Chunked Table
+
+Migrate a multi-million row table with chunking:
+
+```bash
+# 1. Check table size first
+python -c "
+from config.settings import Settings
+from src.schema.extractor import SchemaExtractor
+
+settings = Settings()
+extractor = SchemaExtractor(settings.db2)
+table_def = extractor.extract_table_definition('JRNL_LN')
+print(f'Estimated rows: {table_def.estimated_rows:,}')
+print(f'Key fields: {[f.field_name for f in table_def.fields if f.is_key]}')
+"
+
+# Expected output:
+# Estimated rows: 25,000,000
+# Key fields: ['BUSINESS_UNIT', 'JOURNAL_ID', 'JOURNAL_LINE']
+
+# 2. Run migration (will auto-chunk based on size)
+python -m src --tables PS_JRNL_LN
+
+# Expected output with chunking:
+# [10:35:20] chunking_strategy_determined table=PS_JRNL_LN chunks=50 strategy=NumericRangeChunkStrategy
+# [10:35:22] chunk_completed table=PS_JRNL_LN chunk_id=0 chunk_rows=500000 total_rows=500000
+# [10:35:55] chunk_completed table=PS_JRNL_LN chunk_id=1 chunk_rows=500000 total_rows=1000000
+# ...
+
+# 3. Check staging files (one per chunk)
+ls -lh data/staging/PS_JRNL_LN/
+
+# Expected:
+# PS_JRNL_LN_chunk_000.csv  (42M)
+# PS_JRNL_LN_chunk_001.csv  (42M)
+# ...
+
+# 4. Check checkpoint
+cat data/checkpoints/PS_JRNL_LN.json
+
+# Expected:
+# {
+#   "table": "PS_JRNL_LN",
+#   "status": "completed",
+#   "rows_extracted": 25000000,
+#   "chunk_id": 49,
+#   "completed_at": "2025-01-22T10:45:30Z"
+# }
+```
+
+### Scenario 3: Resume After Interruption
+
+Simulate interruption and resume:
+
+```bash
+# 1. Start migration
+python -m src
+
+# 2. Interrupt with Ctrl+C after a few tables complete
+# Expected output:
+# [yellow]Shutdown requested. Finishing current tasks...[/yellow]
+# Shutting down workers...
+# Migration Summary:
+#   Completed: 15/1847 tables
+#   Failed: 0
+
+# 3. Check what was completed
+ls data/checkpoints/ | grep -c "json"
+# Expected: 15
+
+cat data/checkpoints/PS_VOUCHER.json
+# {
+#   "table": "PS_VOUCHER",
+#   "status": "completed",
+#   ...
+# }
+
+# 4. Resume from checkpoint
+python -m src --resume
+
+# Expected output:
+# Loading checkpoints...
+# Found 15 completed tables, 0 in progress, 0 failed
+# Filtered 15 completed tables
+# Remaining tables: 1,832
+# Starting migration with 2 workers...
+```
+
+### Scenario 4: Handle Failed Tables
+
+What to do when tables fail:
+
+```bash
+# 1. Run migration
+python -m src
+
+# 2. Check for failures in summary
+# Expected output:
+# Migration Summary:
+#   Completed: 1,845/1847 tables
+#   Failed: 2
+#
+# Failed Tables:
+#   - PS_PROBLEM_TABLE: Connection timeout after 3 retries
+#   - PS_ANOTHER_TABLE: Invalid data format in BLOB field
+
+# 3. Check failed checkpoints
+cat data/checkpoints/PS_PROBLEM_TABLE.json
+
+# {
+#   "table": "PS_PROBLEM_TABLE",
+#   "status": "failed",
+#   "error": "Connection timeout after 3 retries",
+#   "rows_extracted": 250000,
+#   ...
+# }
+
+# 4. Retry failed tables only
+python -m src --tables PS_PROBLEM_TABLE,PS_ANOTHER_TABLE
+
+# 5. Or reset and retry
+rm data/checkpoints/PS_PROBLEM_TABLE.json
+python -m src --tables PS_PROBLEM_TABLE
+```
+
+### Scenario 5: Monitor Resource Usage
+
+Watch resource adaptation in action:
+
+```bash
+# Terminal 1: Run migration with verbose logging
+LOG_LEVEL=DEBUG python -m src
+
+# Terminal 2: Monitor system resources
+watch -n 1 'ps aux | grep python; free -h; mpstat 1 1'
+
+# Expected log output showing adaptation:
+# [10:50:00] metrics_collected cpu=45.2 memory=38.5
+# [10:50:00] resources_available_increasing current_workers=2 recommended=3
+# [10:50:00] workers_spawned count=1 total_workers=3
+# ...
+# [10:52:30] metrics_collected cpu=88.5 memory=72.1
+# [10:52:30] resource_overload_backing_off current_workers=8 recommended=6
+# [10:52:30] workers_terminated count=2 remaining_workers=6
+```
+
+## Reading Logs and Checkpoints
+
+### Log Files
+
+Logs are written to `logs/migration.log` with structured JSON:
+
+```bash
+# View all logs
+tail -f logs/migration.log
+
+# Filter for specific table
+grep 'PS_VOUCHER' logs/migration.log | jq '.'
+
+# Find all errors
+grep '"level":"error"' logs/migration.log | jq '.error'
+
+# Check worker performance
+grep 'table_completed' logs/migration.log | jq '{table: .table, rows: .rows, duration: .duration, worker: .worker}'
+```
+
+**Example log entries:**
+
+```json
+{"timestamp": "2025-01-22T10:15:23Z", "level": "info", "event": "table_completed", "table": "PS_VOUCHER", "rows": 5000000, "duration": 182.5, "worker": 3}
+{"timestamp": "2025-01-22T10:16:01Z", "level": "error", "event": "table_failed", "table": "PS_BAD_TABLE", "error": "Connection timeout", "worker": 5}
+{"timestamp": "2025-01-22T10:16:15Z", "level": "info", "event": "worker_count_updated", "old_count": 6, "new_count": 8}
+```
+
+### Checkpoint Files
+
+Each table has a checkpoint file in `data/checkpoints/`:
+
+```bash
+# List all checkpoints
+ls data/checkpoints/
+
+# Check specific table status
+cat data/checkpoints/PS_VOUCHER.json | jq '{table, status, rows: .rows_extracted}'
+
+# Count by status
+for status in completed in_progress failed pending; do
+  count=$(grep "\"status\": \"$status\"" data/checkpoints/*.json 2>/dev/null | wc -l)
+  echo "$status: $count"
+done
+
+# Find incomplete migrations
+grep -l '"status": "in_progress"' data/checkpoints/*.json
+```
+
+### Staging Files
+
+CSV staging files are in `data/staging/{table}/`:
+
+```bash
+# Check staging for specific table
+ls -lh data/staging/PS_VOUCHER/
+
+# View first few rows of CSV
+head -20 data/staging/PS_VOUCHER/PS_VOUCHER.csv
+
+# Count rows in CSV file
+wc -l data/staging/PS_VOUCHER/PS_VOUCHER.csv
+
+# Check for NULL values
+grep '\\N' data/staging/PS_VOUCHER/PS_VOUCHER.csv | head
+```
+
+## Advanced Usage
+
+### Custom Chunking
+
+Override automatic chunking strategy:
+
+```python
+# In src/extraction/chunker.py, modify determine_chunking_strategy()
+# Or set custom chunk size for specific tables
+
+# Example: Force date-based chunking for audit tables
+python -m src --tables PS_AUDIT_TBL --chunk-size 100000
+```
+
+### Selective Migration
+
+Migrate tables by pattern:
+
+```bash
+# All voucher-related tables
+python -m src --tables $(python -c "
+from src.schema.extractor import SchemaExtractor
+from config.settings import Settings
+extractor = SchemaExtractor(Settings().db2)
+tables = [t for t in extractor.extract_table_list() if 'VCHR' in t or 'VOUCHER' in t]
+print(','.join(tables))
+")
+```
+
+### Performance Profiling
+
+Enable detailed performance tracking:
+
+```bash
+# Run with profiling
+LOG_LEVEL=DEBUG python -m src --tables PS_LARGE_TABLE > profile.log 2>&1
+
+# Analyze timing
+grep 'duration' profile.log | jq '{table: .table, duration: .duration}' | sort -k2 -n
+
+# Check resource usage over time
+grep 'metrics_collected' profile.log | jq '{time: .timestamp, cpu: .cpu, memory: .memory}'
+```
+
+### Parallel Schema Extraction
+
+Speed up schema extraction for large databases:
+
+```python
+# Extract schema with multiple workers
+# Create custom script: scripts/parallel_schema_extract.py
+
+from concurrent.futures import ProcessPoolExecutor
+from src.schema.extractor import SchemaExtractor
+
+def extract_table(table_name):
+    extractor = SchemaExtractor(settings.db2)
+    return extractor.extract_table_definition(table_name)
+
+with ProcessPoolExecutor(max_workers=10) as executor:
+    table_defs = list(executor.map(extract_table, table_list))
+```
+
+### Custom Validation Rules
+
+Add domain-specific validation:
+
+```python
+# Create scripts/custom_validation.py
+
+from src.loading.validator import DataValidator
+
+class CustomValidator(DataValidator):
+    def validate_business_rules(self, table: str):
+        """Custom PeopleSoft business rule validation."""
+        if 'VOUCHER' in table:
+            # Check GROSS_AMT > 0
+            query = "SELECT COUNT(*) FROM {table} WHERE GROSS_AMT <= 0"
+            # Run and report
+```
+
+### Batch Processing
+
+Process tables in logical groups:
+
+```bash
+#!/bin/bash
+# scripts/batch_migrate.sh
+
+# Group 1: Reference tables (small, fast)
+python -m src --tables PS_XLATTABLE,PS_INSTALLATION,PS_COUNTRY_TBL
+echo "Reference tables complete"
+
+# Group 2: Master data (medium)
+python -m src --tables PS_VENDOR,PS_CUSTOMER,PS_ITEM
+echo "Master data complete"
+
+# Group 3: Transactional (large, chunked)
+python -m src --tables PS_VOUCHER,PS_VCHR_LINE,PS_JRNL_LN
+echo "Transactional data complete"
+
+# Validate each group
+python -m src.loading validate --mode counts
+```
+
+### Integration with CI/CD
+
+Example GitHub Actions workflow:
+
+```yaml
+# .github/workflows/migration.yml
+name: DB2 to PostgreSQL Migration
+
+on:
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly at 2 AM Sunday
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Run migration
+        env:
+          DB2_DATABASE: ${{ secrets.DB2_DATABASE }}
+          DB2_HOSTNAME: ${{ secrets.DB2_HOSTNAME }}
+          DB2_UID: ${{ secrets.DB2_UID }}
+          DB2_PWD: ${{ secrets.DB2_PWD }}
+        run: python -m src
+
+      - name: Validate
+        run: python -m src.loading validate --mode counts
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: migration-logs
+          path: logs/
 ```
 
 ## Configuration
