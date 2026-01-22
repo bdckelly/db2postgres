@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ps82-to-postgres"
+version = "0.1.0"
+description = "PeopleSoft 8.2 DB2 z/OS to PostgreSQL migration tool with dynamic parallelism"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+    { name = "PS82 Migration Team" }
+]
+keywords = ["peoplesoft", "db2", "postgresql", "migration", "data-engineering"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "ibm-db>=3.2.0",           # DB2 z/OS driver
+    "psycopg[binary]>=3.1.0",  # PostgreSQL driver with binary package
+    "pydantic-settings>=2.0.0", # Configuration management with validation
+    "psutil>=5.9.0",           # System resource monitoring (CPU, memory)
+    "rich>=13.0.0",            # Progress display and terminal UI
+    "structlog>=23.0.0",       # Structured logging
+    "python-dotenv>=1.0.0",    # .env file support
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.12.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+ps82-migrate = "src.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "config*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --strict-markers"
+
+[tool.coverage.run]
+source = ["src", "config"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false
