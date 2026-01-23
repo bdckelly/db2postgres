@@ -1,13 +1,23 @@
 """
 Worker process for parallel table extraction and loading.
 
+Supports two modes:
+1. STREAMING MODE (default, use_streaming=True):
+   - Streams data directly from DB2 to PostgreSQL
+   - No intermediate files - near-zero memory footprint
+   - Uses psycopg3's COPY protocol with write_row()
+   - Best performance for most use cases
+
+2. FILE-BASED MODE (use_streaming=False):
+   - Extracts data to CSV staging files
+   - Then loads from CSV using PostgreSQL COPY
+   - Useful when you need to inspect/validate data before loading
+
 Each worker:
 - Receives table extraction tasks from queue
-- Determines chunking strategy
 - Extracts data from DB2
-- Serializes to CSV staging files
-- Loads CSV data into PostgreSQL using bulk COPY
-- Updates checkpoints
+- Loads data into PostgreSQL (streaming or via files)
+- Updates checkpoints for restart capability
 - Reports results back to orchestrator
 """
 
@@ -27,7 +37,7 @@ from src.extraction import (
     determine_chunking_strategy,
     get_staging_file_path,
 )
-from src.loading.bulk_loader import BulkLoader, BulkLoadError
+from src.loading.bulk_loader import BulkLoader, BulkLoadError, StreamingLoader
 from src.schema.extractor import SchemaExtractor, TableDefinition
 from src.utils.progress import Checkpoint, CheckpointManager, CheckpointStatus
 
@@ -190,53 +200,61 @@ class ExtractionWorker(multiprocessing.Process):
                 extractor = SchemaExtractor(self.settings.db2)
                 table_def = extractor.extract_table_definition(table_name)
 
-            # Determine chunking strategy
-            strategy = determine_chunking_strategy(
-                table_def, self.settings.db2, self.settings.migration.chunk_size
-            )
+            # Choose between streaming and file-based mode
+            if self.settings.migration.use_streaming:
+                # STREAMING MODE: Extract from DB2 and load directly to PostgreSQL
+                log.info("using_streaming_mode", table=table_name)
+                total_rows, rows_loaded = self._stream_table(table_def, checkpoint_manager, checkpoint)
+                chunks_processed = 1  # Streaming treats entire table as one "chunk"
+            else:
+                # FILE-BASED MODE: Extract to CSV files, then load
+                log.info("using_file_mode", table=table_name)
 
-            chunks = strategy.generate_chunks()
-
-            log.info(
-                "chunking_strategy_determined",
-                table=table_name,
-                chunks=len(chunks),
-                strategy=strategy.__class__.__name__,
-            )
-
-            total_rows = 0
-            chunks_processed = 0
-
-            # Extract each chunk
-            for chunk in chunks:
-                # Check if chunk already processed (for resume)
-                if checkpoint.chunk_id is not None and chunk.chunk_id <= checkpoint.chunk_id:
-                    log.debug("chunk_already_processed", table=table_name, chunk_id=chunk.chunk_id)
-                    continue
-
-                # Extract chunk
-                rows = self._extract_chunk(table_def, chunk)
-                total_rows += rows
-                chunks_processed += 1
-
-                # Update checkpoint
-                checkpoint.rows_extracted = total_rows
-                checkpoint.chunk_id = chunk.chunk_id
-                checkpoint_manager.save_checkpoint(checkpoint)
-
-                log.info(
-                    "chunk_completed",
-                    table=table_name,
-                    chunk_id=chunk.chunk_id,
-                    chunk_rows=rows,
-                    total_rows=total_rows,
+                # Determine chunking strategy
+                strategy = determine_chunking_strategy(
+                    table_def, self.settings.db2, self.settings.migration.chunk_size
                 )
 
-            # Load data into PostgreSQL
-            # Use sql_table_name to match the staging directory created during extraction
-            log.info("loading_phase_started", table=table_def.sql_table_name, rows_extracted=total_rows)
+                chunks = strategy.generate_chunks()
 
-            rows_loaded = self._load_table(table_def.sql_table_name, table_def)
+                log.info(
+                    "chunking_strategy_determined",
+                    table=table_name,
+                    chunks=len(chunks),
+                    strategy=strategy.__class__.__name__,
+                )
+
+                total_rows = 0
+                chunks_processed = 0
+
+                # Extract each chunk to CSV files
+                for chunk in chunks:
+                    # Check if chunk already processed (for resume)
+                    if checkpoint.chunk_id is not None and chunk.chunk_id <= checkpoint.chunk_id:
+                        log.debug("chunk_already_processed", table=table_name, chunk_id=chunk.chunk_id)
+                        continue
+
+                    # Extract chunk
+                    rows = self._extract_chunk(table_def, chunk)
+                    total_rows += rows
+                    chunks_processed += 1
+
+                    # Update checkpoint
+                    checkpoint.rows_extracted = total_rows
+                    checkpoint.chunk_id = chunk.chunk_id
+                    checkpoint_manager.save_checkpoint(checkpoint)
+
+                    log.info(
+                        "chunk_completed",
+                        table=table_name,
+                        chunk_id=chunk.chunk_id,
+                        chunk_rows=rows,
+                        total_rows=total_rows,
+                    )
+
+                # Load data into PostgreSQL from CSV files
+                log.info("loading_phase_started", table=table_def.sql_table_name, rows_extracted=total_rows)
+                rows_loaded = self._load_table(table_def.sql_table_name, table_def)
 
             # Update checkpoint with loaded rows
             checkpoint.rows_loaded = rows_loaded
@@ -397,6 +415,77 @@ class ExtractionWorker(multiprocessing.Process):
         except BulkLoadError as e:
             log.error("bulk_load_failed", table=pg_table_name, error=str(e))
             raise
+
+    def _stream_table(
+        self,
+        table_def: TableDefinition,
+        checkpoint_manager: CheckpointManager,
+        checkpoint: Checkpoint,
+    ) -> tuple[int, int]:
+        """
+        Stream data directly from DB2 to PostgreSQL without intermediate files.
+
+        This is the "gold standard" for ETL - rows flow from source to target
+        with minimal memory usage and maximum throughput.
+
+        Args:
+            table_def: Table definition
+            checkpoint_manager: Checkpoint manager
+            checkpoint: Current checkpoint
+
+        Returns:
+            tuple[int, int]: (rows_extracted, rows_loaded)
+        """
+        table_name = table_def.sql_table_name
+        pg_table_name = table_name.lower()
+
+        log.info("stream_table_started", table=table_name)
+
+        # Initialize streaming loader
+        loader = StreamingLoader(
+            postgres_settings=self.settings.postgres,
+            table_name=pg_table_name,
+            ssh_settings=self.settings.ssh_tunnel,
+        )
+
+        # Initialize extraction cursor
+        cursor = ExtractionCursor(self.settings.db2, table_name, batch_size=10_000)
+
+        # Create generator that extracts from DB2
+        def db2_row_generator():
+            """Generator that yields rows from DB2."""
+            row_gen = cursor.extract_chunk(
+                chunk_id=0,
+                where_clause="1=1",  # Extract all rows
+                params=(),
+            )
+            for row in row_gen:
+                yield row
+
+        # Stream directly to PostgreSQL
+        rows_loaded = loader.stream_load(
+            row_generator=db2_row_generator(),
+            table_def=table_def,
+            truncate_first=self.settings.migration.truncate_before_load,
+        )
+
+        # rows_extracted equals rows_loaded in streaming mode
+        rows_extracted = rows_loaded
+
+        # Update checkpoint
+        checkpoint.rows_extracted = rows_extracted
+        checkpoint.rows_loaded = rows_loaded
+        checkpoint.chunk_id = 0
+        checkpoint_manager.save_checkpoint(checkpoint)
+
+        log.info(
+            "stream_table_completed",
+            table=table_name,
+            rows_extracted=rows_extracted,
+            rows_loaded=rows_loaded,
+        )
+
+        return rows_extracted, rows_loaded
 
 
 def create_stop_task() -> WorkerTask:

@@ -122,14 +122,17 @@ class MigrationSettings(BaseSettings):
     chunk_size: int = Field(default=500_000, description="Default rows per chunk for large tables")
 
     # Loading settings
+    use_streaming: bool = Field(
+        default=True, description="Stream data directly from DB2 to PostgreSQL (no staging files)"
+    )
     drop_indexes_threshold: int = Field(
-        default=1, description="Drop indexes if table has more than this many CSV chunks"
+        default=1, description="Drop indexes if table has more than this many CSV chunks (file mode only)"
     )
     truncate_before_load: bool = Field(
         default=False, description="Truncate PostgreSQL tables before loading (for re-runs)"
     )
     skip_loading: bool = Field(
-        default=False, description="Skip loading phase (extraction only)"
+        default=False, description="Skip loading phase (extraction only, file mode only)"
     )
 
     # Directory paths

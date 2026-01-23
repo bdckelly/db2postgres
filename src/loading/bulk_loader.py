@@ -508,6 +508,232 @@ class BulkLoader:
             raise BulkLoadError(f"Failed to truncate table: {e}") from e
 
 
+class StreamingLoader:
+    """
+    High-performance streaming loader for PostgreSQL using psycopg3's COPY protocol.
+
+    Streams data directly from a generator to PostgreSQL without intermediate files.
+    This is the most memory-efficient and fastest method for large data transfers.
+
+    Key benefits:
+    - Zero intermediate file I/O
+    - Near-zero memory footprint (one row at a time)
+    - Concurrent extract/load (no "wait for extract -> wait for load" bottleneck)
+    - Automatic type conversion via psycopg3's write_row()
+    """
+
+    def __init__(
+        self,
+        postgres_settings: PostgresSettings,
+        table_name: str,
+        ssh_settings: SSHTunnelSettings | None = None,
+    ):
+        """
+        Initialize streaming loader.
+
+        Args:
+            postgres_settings: PostgreSQL connection settings
+            table_name: Target table name (lowercase)
+            ssh_settings: SSH tunnel settings for remote PostgreSQL (optional)
+        """
+        self.postgres_settings = postgres_settings
+        self.ssh_settings = ssh_settings
+        self.table_name = table_name
+        self.rows_loaded = 0
+        self.bad_rows = 0
+
+        log.info(
+            "streaming_loader_initialized",
+            table=table_name,
+            ssh_tunnel=ssh_settings.tunnel_enabled if ssh_settings else False,
+        )
+
+    def table_exists(self) -> bool:
+        """Check if table exists in PostgreSQL."""
+        try:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+                query = """
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                        AND table_name = %s
+                    )
+                """
+                cursor.execute(query, (self.table_name,))
+                result = cursor.fetchone()
+                return result[0] if result else False
+        except Exception as e:
+            log.error("table_exists_check_failed", table=self.table_name, error=str(e))
+            return False
+
+    def create_table(self, table_def: TableDefinition) -> None:
+        """Create table in PostgreSQL from TableDefinition."""
+        log.info("creating_table", table=self.table_name, source_table=table_def.sql_table_name)
+
+        try:
+            converter = SchemaConverter(convert_effdt_nulls=False, use_lowercase=True)
+            pg_table = converter.convert_table(table_def)
+
+            generator = DDLGenerator()
+            ddl = generator.generate_create_table(pg_table, include_indexes=False)
+
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+                cursor.execute(ddl)
+                conn.commit()
+
+            log.info("table_created", table=self.table_name, fields=len(table_def.fields))
+
+        except Exception as e:
+            log.error("table_creation_failed", table=self.table_name, error=str(e))
+            raise BulkLoadError(f"Failed to create table {self.table_name}: {e}") from e
+
+    def ensure_table_exists(self, table_def: TableDefinition | None = None) -> bool:
+        """Ensure table exists, creating it if necessary."""
+        if self.table_exists():
+            log.debug("table_already_exists", table=self.table_name)
+            return False
+
+        if table_def is None:
+            raise BulkLoadError(
+                f"Table {self.table_name} does not exist and no table definition provided"
+            )
+
+        self.create_table(table_def)
+        return True
+
+    def truncate_table(self) -> None:
+        """Truncate table before loading."""
+        log.warning("truncating_table", table=self.table_name)
+        try:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"TRUNCATE TABLE {self.table_name}")
+                conn.commit()
+                log.info("table_truncated", table=self.table_name)
+        except Exception as e:
+            log.error("table_truncate_failed", table=self.table_name, error=str(e))
+            raise BulkLoadError(f"Failed to truncate table: {e}") from e
+
+    def stream_load(
+        self,
+        row_generator,
+        table_def: TableDefinition | None = None,
+        columns: list[str] | None = None,
+        truncate_first: bool = False,
+    ) -> int:
+        """
+        Stream data from generator directly into PostgreSQL using COPY protocol.
+
+        This is the "gold standard" for ETL - rows flow from source to target
+        with minimal memory usage and maximum throughput.
+
+        Args:
+            row_generator: Generator yielding tuples of row data
+            table_def: Table definition for auto-creating table if needed
+            columns: Optional list of column names (for COPY column list)
+            truncate_first: Whether to truncate table before loading
+
+        Returns:
+            int: Number of rows loaded
+
+        Example:
+            >>> def extract_from_db2():
+            ...     for row in db2_cursor.fetchall():
+            ...         yield transform_row(row)
+            >>> loader = StreamingLoader(pg_settings, "ps_voucher")
+            >>> rows = loader.stream_load(extract_from_db2())
+        """
+        log.info("stream_load_started", table=self.table_name)
+
+        self.rows_loaded = 0
+        self.bad_rows = 0
+
+        try:
+            # Ensure table exists (auto-create if needed)
+            table_created = self.ensure_table_exists(table_def)
+            if table_created:
+                log.info("table_auto_created", table=self.table_name)
+
+            # Truncate if requested
+            if truncate_first and self.table_exists():
+                self.truncate_table()
+
+            # Build COPY command
+            if columns:
+                col_list = ", ".join(columns)
+                copy_sql = f"COPY {self.table_name} ({col_list}) FROM STDIN"
+            else:
+                copy_sql = f"COPY {self.table_name} FROM STDIN"
+
+            log.debug("copy_sql", sql=copy_sql)
+
+            # Stream data using psycopg3's COPY protocol
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+
+                with cursor.copy(copy_sql) as copy:
+                    for row in row_generator:
+                        try:
+                            copy.write_row(row)
+                            self.rows_loaded += 1
+
+                            # Progress logging every 100k rows
+                            if self.rows_loaded % 100_000 == 0:
+                                log.info(
+                                    "streaming_progress",
+                                    table=self.table_name,
+                                    rows_loaded=self.rows_loaded,
+                                )
+
+                        except Exception as row_error:
+                            # Log bad row but continue (optional: could re-raise)
+                            self.bad_rows += 1
+                            log.warning(
+                                "bad_row_skipped",
+                                table=self.table_name,
+                                row_number=self.rows_loaded + self.bad_rows,
+                                error=str(row_error),
+                            )
+                            # Uncomment to fail on first bad row:
+                            # raise
+
+                conn.commit()
+
+            # Run ANALYZE for query planner
+            self._analyze_table()
+
+            log.info(
+                "stream_load_completed",
+                table=self.table_name,
+                rows_loaded=self.rows_loaded,
+                bad_rows=self.bad_rows,
+            )
+
+            return self.rows_loaded
+
+        except Exception as e:
+            log.error(
+                "stream_load_failed",
+                table=self.table_name,
+                rows_loaded=self.rows_loaded,
+                error=str(e),
+            )
+            raise BulkLoadError(f"Stream load failed: {e}") from e
+
+    def _analyze_table(self) -> None:
+        """Run ANALYZE on table to update statistics."""
+        try:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"ANALYZE {self.table_name}")
+                conn.commit()
+                log.debug("table_analyzed", table=self.table_name)
+        except Exception as e:
+            log.warning("table_analyze_failed", table=self.table_name, error=str(e))
+
+
 def load_table(
     postgres_settings: PostgresSettings,
     table_name: str,

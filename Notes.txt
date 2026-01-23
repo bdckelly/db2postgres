@@ -6,3 +6,10 @@ python utilities/reset_migration.py --all
 
 # Manual Copy
 python utilities/generate_create_table.py utilities/SYSCOLUMNS_202601231305.csv PS_INSTALLATION PSF8DEV
+
+
+#TODO
+Indexes
+Views
+Note: The current ExtractionCursor materializes rows due to JDBC limitations. For true row-by-row streaming with ibm_db, you'd need to use ibm_db.fetch_tuple() in a while loop instead of fetchall().
+Minimize logging
