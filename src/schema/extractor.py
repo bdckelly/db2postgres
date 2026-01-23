@@ -16,6 +16,49 @@ from config.settings import DB2Settings
 log = structlog.get_logger()
 
 
+def _jdbc_value_to_python(value: Any) -> Any:
+    """
+    Convert JDBC value to Python type.
+
+    JDBC drivers return Java objects (java.lang.Integer, java.lang.String, etc.)
+    which need to be converted to Python types.
+
+    Args:
+        value: Value from JDBC cursor (may be Java object or None)
+
+    Returns:
+        Python equivalent (str, int, float, None, etc.)
+    """
+    if value is None:
+        return None
+
+    # Get the string representation to check Java type
+    value_str = str(type(value))
+
+    # Handle Java Integer types
+    if 'java.lang.Integer' in value_str or 'java.lang.Long' in value_str or 'java.lang.Short' in value_str:
+        return int(str(value))
+
+    # Handle Java floating point types
+    if 'java.lang.Double' in value_str or 'java.lang.Float' in value_str:
+        return float(str(value))
+
+    # Handle Java String
+    if 'java.lang.String' in value_str:
+        return str(value).strip()
+
+    # Handle Java Boolean
+    if 'java.lang.Boolean' in value_str:
+        return bool(value)
+
+    # For native Python types or unknown types, return as-is
+    # This handles cases where we're using ibm_db or mock connection
+    if isinstance(value, str):
+        return value.strip()
+
+    return value
+
+
 @dataclass
 class FieldDefinition:
     """Definition of a table field from PeopleSoft catalog."""
@@ -127,7 +170,7 @@ class SchemaExtractor:
                     cursor.execute(query + " WITH UR")
 
                 rows = cursor.fetchall()
-                table_list = [row[0].strip() for row in rows]
+                table_list = [_jdbc_value_to_python(row[0]) for row in rows]
 
                 log.info("table_list_extracted", count=len(table_list))
                 return table_list
@@ -164,11 +207,21 @@ class SchemaExtractor:
                     log.warning("table_metadata_not_found", record_name=record_name)
                     return {}
 
+                # Extract values
+                rec_name = _jdbc_value_to_python(row[0])
+                sql_table = _jdbc_value_to_python(row[1])
+                descr = _jdbc_value_to_python(row[2])
+                rec_type = _jdbc_value_to_python(row[3])
+
+                # Use PS_{record_name} if sql_table_name is empty
+                if not sql_table or sql_table.strip() == "":
+                    sql_table = f"PS_{rec_name}"
+
                 metadata = {
-                    "record_name": row[0].strip(),
-                    "sql_table_name": row[1].strip() if row[1] else f"PS_{record_name}",
-                    "description": row[2].strip() if row[2] else None,
-                    "record_type": row[3],
+                    "record_name": rec_name,
+                    "sql_table_name": sql_table,
+                    "description": descr if descr else None,
+                    "record_type": rec_type,
                 }
 
                 log.debug("table_metadata_extracted", record_name=record_name)
@@ -205,10 +258,10 @@ class SchemaExtractor:
 
                 fields = [
                     (
-                        row[0].strip(),
-                        row[1],
-                        row[2].strip() if row[2] else None,
-                        row[3].strip() if row[3] else None,
+                        _jdbc_value_to_python(row[0]),
+                        _jdbc_value_to_python(row[1]),
+                        _jdbc_value_to_python(row[2]) if row[2] else None,
+                        _jdbc_value_to_python(row[3]) if row[3] else None,
                     )
                     for row in rows
                 ]
@@ -249,10 +302,10 @@ class SchemaExtractor:
                     return {}
 
                 details = {
-                    "field_name": row[0].strip(),
-                    "field_type": row[1],
-                    "length": row[2] if row[2] else None,
-                    "decimal_pos": row[3] if row[3] else None,
+                    "field_name": _jdbc_value_to_python(row[0]),
+                    "field_type": _jdbc_value_to_python(row[1]),
+                    "length": _jdbc_value_to_python(row[2]) if row[2] else None,
+                    "decimal_pos": _jdbc_value_to_python(row[3]) if row[3] else None,
                 }
 
                 log.debug("field_details_extracted", field_name=field_name)
@@ -288,7 +341,7 @@ class SchemaExtractor:
                 cursor.execute(query, (record_name,))
                 rows = cursor.fetchall()
 
-                key_fields = [row[0].strip() for row in rows]
+                key_fields = [_jdbc_value_to_python(row[0]) for row in rows]
 
                 log.debug("key_fields_extracted", record_name=record_name, count=len(key_fields))
                 return key_fields

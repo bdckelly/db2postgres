@@ -1,11 +1,12 @@
 """
-Worker process for parallel table extraction.
+Worker process for parallel table extraction and loading.
 
 Each worker:
 - Receives table extraction tasks from queue
 - Determines chunking strategy
 - Extracts data from DB2
-- Serializes to CSV
+- Serializes to CSV staging files
+- Loads CSV data into PostgreSQL using bulk COPY
 - Updates checkpoints
 - Reports results back to orchestrator
 """
@@ -13,6 +14,7 @@ Each worker:
 import multiprocessing
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -25,6 +27,7 @@ from src.extraction import (
     determine_chunking_strategy,
     get_staging_file_path,
 )
+from src.loading.bulk_loader import BulkLoader, BulkLoadError
 from src.schema.extractor import SchemaExtractor, TableDefinition
 from src.utils.progress import Checkpoint, CheckpointManager, CheckpointStatus
 
@@ -46,6 +49,7 @@ class WorkerTask:
     table_name: str | None = None
     table_def: TableDefinition | None = None
     chunk_id: int | None = None
+    resume: bool = False  # If True, resume from checkpoint; if False, start fresh
 
 
 @dataclass
@@ -56,6 +60,7 @@ class WorkerResult:
     table_name: str
     success: bool
     rows_extracted: int = 0
+    rows_loaded: int = 0
     chunks_processed: int = 0
     duration_seconds: float = 0.0
     error: str | None = None
@@ -158,15 +163,26 @@ class ExtractionWorker(multiprocessing.Process):
         try:
             # Load or create checkpoint
             checkpoint = checkpoint_manager.load_checkpoint(table_name)
+
             if not checkpoint:
+                # New table - create fresh checkpoint
                 checkpoint = Checkpoint(
                     table=table_name,
                     status=CheckpointStatus.IN_PROGRESS,
                     started_at=None,
                 )
+            elif not task.resume:
+                # Not resuming - reset checkpoint for fresh extraction
+                log.info("resetting_checkpoint_for_fresh_start", table=table_name)
+                checkpoint.rows_extracted = 0
+                checkpoint.rows_loaded = 0
+                checkpoint.chunk_id = None
+                checkpoint.last_key = None
+                checkpoint.error = None
+                checkpoint.completed_at = None
 
             checkpoint.status = CheckpointStatus.IN_PROGRESS
-            checkpoint.started_at = checkpoint.started_at or start_time
+            checkpoint.started_at = checkpoint.started_at or datetime.now()
             checkpoint_manager.save_checkpoint(checkpoint)
 
             # If table definition not provided, extract it
@@ -216,9 +232,16 @@ class ExtractionWorker(multiprocessing.Process):
                     total_rows=total_rows,
                 )
 
-            # Mark as completed
+            # Load data into PostgreSQL
+            # Use sql_table_name to match the staging directory created during extraction
+            log.info("loading_phase_started", table=table_def.sql_table_name, rows_extracted=total_rows)
+
+            rows_loaded = self._load_table(table_def.sql_table_name, table_def)
+
+            # Update checkpoint with loaded rows
+            checkpoint.rows_loaded = rows_loaded
             checkpoint.status = CheckpointStatus.COMPLETED
-            checkpoint.completed_at = time.time()
+            checkpoint.completed_at = datetime.now()
             checkpoint_manager.save_checkpoint(checkpoint)
 
             duration = time.time() - start_time
@@ -226,7 +249,8 @@ class ExtractionWorker(multiprocessing.Process):
             log.info(
                 "task_completed",
                 table=table_name,
-                rows=total_rows,
+                rows_extracted=total_rows,
+                rows_loaded=rows_loaded,
                 chunks=chunks_processed,
                 duration=duration,
             )
@@ -236,6 +260,7 @@ class ExtractionWorker(multiprocessing.Process):
                 table_name=table_name,
                 success=True,
                 rows_extracted=total_rows,
+                rows_loaded=rows_loaded,
                 chunks_processed=chunks_processed,
                 duration_seconds=duration,
             )
@@ -308,6 +333,71 @@ class ExtractionWorker(multiprocessing.Process):
 
         return rows_written
 
+    def _load_table(self, table_name: str, table_def: TableDefinition) -> int:
+        """
+        Load extracted CSV files into PostgreSQL.
+
+        Args:
+            table_name: Table name (will be lowercased for PostgreSQL)
+            table_def: Source table definition for auto-creating table if needed
+
+        Returns:
+            int: Number of rows loaded
+        """
+        # Check if loading is disabled
+        if self.settings.migration.skip_loading:
+            log.info("loading_skipped", table=table_name, reason="skip_loading enabled")
+            return 0
+
+        # PostgreSQL table name is lowercase
+        pg_table_name = table_name.lower()
+        staging_dir = self.settings.migration.staging_dir
+
+        log.info("loading_table", table=pg_table_name, staging_dir=str(staging_dir))
+
+        # Find all CSV files for this table
+        table_staging_dir = staging_dir / table_name
+        csv_files = sorted(table_staging_dir.glob("*.csv"))
+
+        if not csv_files:
+            log.warning("no_csv_files_found", table=table_name, staging_dir=str(table_staging_dir))
+            return 0
+
+        log.info("found_csv_files", table=table_name, count=len(csv_files))
+
+        # Determine if we should drop indexes based on threshold
+        drop_indexes = len(csv_files) > self.settings.migration.drop_indexes_threshold
+
+        loader = BulkLoader(
+            postgres_settings=self.settings.postgres,
+            table_name=pg_table_name,
+            drop_indexes=drop_indexes,
+            ssh_settings=self.settings.ssh_tunnel,
+        )
+
+        try:
+            # Truncate table if configured (for re-runs)
+            # Only truncate if table already exists
+            if self.settings.migration.truncate_before_load and loader.table_exists():
+                loader.truncate_table()
+
+            # Load with index management (handles drop/rebuild and auto-create)
+            rows_loaded = loader.load_with_index_management(csv_files, table_def=table_def)
+
+            log.info(
+                "table_loaded",
+                table=pg_table_name,
+                rows_loaded=rows_loaded,
+                csv_files=len(csv_files),
+                drop_indexes=drop_indexes,
+            )
+
+            return rows_loaded
+
+        except BulkLoadError as e:
+            log.error("bulk_load_failed", table=pg_table_name, error=str(e))
+            raise
+
 
 def create_stop_task() -> WorkerTask:
     """
@@ -320,7 +410,9 @@ def create_stop_task() -> WorkerTask:
 
 
 def create_extraction_task(
-    table_name: str, table_def: TableDefinition | None = None
+    table_name: str,
+    table_def: TableDefinition | None = None,
+    resume: bool = False,
 ) -> WorkerTask:
     """
     Create table extraction task.
@@ -328,6 +420,7 @@ def create_extraction_task(
     Args:
         table_name: Table name (record name)
         table_def: Optional table definition (will be extracted if not provided)
+        resume: If True, resume from checkpoint; if False, start fresh
 
     Returns:
         WorkerTask: Extraction task
@@ -336,4 +429,5 @@ def create_extraction_task(
         task_type=TaskType.EXTRACT_TABLE,
         table_name=table_name,
         table_def=table_def,
+        resume=resume,
     )

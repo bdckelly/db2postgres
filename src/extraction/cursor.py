@@ -14,7 +14,7 @@ from typing import Any, Generator
 
 import structlog
 
-from config.db2_connection import DB2ConnectionError, get_db2_connection
+from config.db2_connection import DB2ConnectionError, create_connection, get_db2_connection
 from config.settings import DB2Settings
 
 log = structlog.get_logger()
@@ -59,6 +59,49 @@ class ExtractionCursor:
             table=table_name,
             batch_size=batch_size,
         )
+
+    @staticmethod
+    def _convert_jdbc_value(value: Any) -> Any:
+        """
+        Convert JDBC value to Python type.
+
+        JDBC drivers return Java objects (java.lang.Integer, java.lang.String, etc.)
+        which need to be converted to Python types immediately to avoid "result set closed" errors.
+
+        Args:
+            value: Value from JDBC cursor (may be Java object or None)
+
+        Returns:
+            Python equivalent (str, int, float, None, etc.)
+        """
+        if value is None:
+            return None
+
+        # Get the string representation to check Java type
+        value_str = str(type(value))
+
+        # Handle Java Integer types
+        if 'java.lang' in value_str and ('Integer' in value_str or 'Long' in value_str or 'Short' in value_str):
+            return int(str(value))
+
+        # Handle Java floating point types
+        if 'java.lang' in value_str and ('Double' in value_str or 'Float' in value_str):
+            return float(str(value))
+
+        # Handle Java String
+        if 'java.lang.String' in value_str:
+            return str(value)
+
+        # Handle Java Boolean
+        if 'java.lang.Boolean' in value_str:
+            return bool(value)
+
+        # For native Python types or unknown types, return as-is
+        # This handles cases where we're using ibm_db or mock connection
+        if isinstance(value, str):
+            return value
+
+        return value
 
     def execute_with_retry(
         self,
@@ -168,44 +211,52 @@ class ExtractionCursor:
             WITH UR
         """
 
+        # Manually manage connection to keep it open during generator iteration
+        conn = None
+        cursor = None
+
         try:
-            with get_db2_connection(self.db2_settings) as conn:
-                cursor = conn.cursor()
+            conn = create_connection(self.db2_settings)
+            cursor = conn.cursor()
 
-                try:
-                    # Execute query with retry logic
-                    self.execute_with_retry(cursor, query, params)
+            # Execute query with retry logic
+            self.execute_with_retry(cursor, query, params)
 
-                    # Fetch in batches
-                    while True:
-                        rows = cursor.fetchmany(self.batch_size)
+            # JDBC workaround: Fetch ALL rows immediately
+            # JDBC result sets close when generator yields, so we must materialize everything first
+            all_rows = cursor.fetchall()
 
-                        if not rows:
-                            break
+            log.info(
+                "rows_fetched_from_db",
+                table=self.table_name,
+                chunk_id=chunk_id,
+                total_rows=len(all_rows),
+            )
 
-                        self.rows_fetched += len(rows)
+            # Materialize all data immediately while connection is still open
+            materialized_rows = []
+            for row in all_rows:
+                python_row = []
+                for val in row:
+                    if val is None:
+                        python_row.append(None)
+                    else:
+                        # Convert to string to force complete materialization
+                        python_row.append(str(val))
+                materialized_rows.append(tuple(python_row))
 
-                        # Yield each row
-                        for row in rows:
-                            yield row
+            # Now yield the fully materialized rows
+            # Connection can close after this point
+            for python_row in materialized_rows:
+                self.rows_fetched += 1
+                yield python_row
 
-                        log.debug(
-                            "batch_fetched",
-                            table=self.table_name,
-                            chunk_id=chunk_id,
-                            rows_fetched=self.rows_fetched,
-                            batch_size=len(rows),
-                        )
-
-                    log.info(
-                        "chunk_extraction_completed",
-                        table=self.table_name,
-                        chunk_id=chunk_id,
-                        total_rows=self.rows_fetched,
-                    )
-
-                finally:
-                    cursor.close()
+            log.info(
+                "chunk_extraction_completed",
+                table=self.table_name,
+                chunk_id=chunk_id,
+                total_rows=self.rows_fetched,
+            )
 
         except Exception as e:
             log.error(
@@ -216,6 +267,20 @@ class ExtractionCursor:
                 error=str(e),
             )
             raise
+
+        finally:
+            # Clean up cursor and connection
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def extract_all(
         self,

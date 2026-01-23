@@ -15,7 +15,10 @@ from typing import Any
 import structlog
 
 from config.postgres_connection import PostgresConnectionError, get_bulk_load_connection
-from config.settings import PostgresSettings
+from config.settings import PostgresSettings, SSHTunnelSettings
+from src.schema.converter import SchemaConverter
+from src.schema.extractor import TableDefinition
+from src.schema.generator import DDLGenerator
 
 log = structlog.get_logger()
 
@@ -42,6 +45,7 @@ class BulkLoader:
         postgres_settings: PostgresSettings,
         table_name: str,
         drop_indexes: bool = False,
+        ssh_settings: SSHTunnelSettings | None = None,
     ):
         """
         Initialize bulk loader.
@@ -50,8 +54,10 @@ class BulkLoader:
             postgres_settings: PostgreSQL connection settings
             table_name: Target table name (lowercase)
             drop_indexes: If True, drop indexes before load and rebuild after
+            ssh_settings: SSH tunnel settings for remote PostgreSQL (optional)
         """
         self.postgres_settings = postgres_settings
+        self.ssh_settings = ssh_settings
         self.table_name = table_name
         self.drop_indexes = drop_indexes
         self.rows_loaded = 0
@@ -62,7 +68,109 @@ class BulkLoader:
             "bulk_loader_initialized",
             table=table_name,
             drop_indexes=drop_indexes,
+            ssh_tunnel=ssh_settings.tunnel_enabled if ssh_settings else False,
         )
+
+    def table_exists(self) -> bool:
+        """
+        Check if table exists in PostgreSQL.
+
+        Returns:
+            bool: True if table exists, False otherwise
+        """
+        log.debug("checking_table_exists", table=self.table_name)
+
+        try:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+
+                query = """
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_schema = 'public'
+                        AND table_name = %s
+                    )
+                """
+
+                cursor.execute(query, (self.table_name,))
+                result = cursor.fetchone()
+                exists = result[0] if result else False
+
+                log.debug("table_exists_check", table=self.table_name, exists=exists)
+                return exists
+
+        except Exception as e:
+            log.error("table_exists_check_failed", table=self.table_name, error=str(e))
+            # Assume table doesn't exist on error
+            return False
+
+    def create_table(self, table_def: TableDefinition) -> None:
+        """
+        Create table in PostgreSQL from TableDefinition.
+
+        Uses SchemaConverter and DDLGenerator to convert DB2 definition
+        to PostgreSQL DDL and execute it.
+
+        Args:
+            table_def: Source table definition from DB2
+
+        Raises:
+            BulkLoadError: If table creation fails
+        """
+        log.info("creating_table", table=self.table_name, source_table=table_def.sql_table_name)
+
+        try:
+            # Convert table definition to PostgreSQL
+            converter = SchemaConverter(convert_effdt_nulls=False, use_lowercase=True)
+            pg_table = converter.convert_table(table_def)
+
+            # Generate DDL
+            generator = DDLGenerator()
+            ddl = generator.generate_create_table(pg_table, include_indexes=False)
+
+            log.debug("generated_ddl", table=self.table_name, ddl_length=len(ddl))
+
+            # Execute DDL
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+                cursor.execute(ddl)
+                conn.commit()
+
+            log.info(
+                "table_created",
+                table=self.table_name,
+                fields=len(table_def.fields),
+                keys=len(table_def.key_fields),
+            )
+
+        except Exception as e:
+            log.error("table_creation_failed", table=self.table_name, error=str(e))
+            raise BulkLoadError(f"Failed to create table {self.table_name}: {e}") from e
+
+    def ensure_table_exists(self, table_def: TableDefinition | None = None) -> bool:
+        """
+        Ensure table exists, creating it if necessary.
+
+        Args:
+            table_def: Source table definition (required if table needs to be created)
+
+        Returns:
+            bool: True if table was created, False if it already existed
+
+        Raises:
+            BulkLoadError: If table doesn't exist and no table_def provided
+        """
+        if self.table_exists():
+            log.debug("table_already_exists", table=self.table_name)
+            return False
+
+        if table_def is None:
+            raise BulkLoadError(
+                f"Table {self.table_name} does not exist and no table definition provided for auto-creation"
+            )
+
+        self.create_table(table_def)
+        return True
 
     def get_table_indexes(self) -> list[tuple[str, str]]:
         """
@@ -74,7 +182,7 @@ class BulkLoader:
         log.debug("fetching_indexes", table=self.table_name)
 
         try:
-            with get_bulk_load_connection(self.postgres_settings, self.table_name) as conn:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
                 cursor = conn.cursor()
 
                 query = """
@@ -106,7 +214,7 @@ class BulkLoader:
         indexes = self.get_table_indexes()
 
         try:
-            with get_bulk_load_connection(self.postgres_settings, self.table_name) as conn:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
                 cursor = conn.cursor()
 
                 for index_name, index_def in indexes:
@@ -144,7 +252,7 @@ class BulkLoader:
         log.info("rebuilding_indexes", table=self.table_name, count=len(self.dropped_indexes))
 
         try:
-            with get_bulk_load_connection(self.postgres_settings, self.table_name) as conn:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
                 cursor = conn.cursor()
 
                 for index_name, index_def in self.dropped_indexes:
@@ -194,7 +302,7 @@ class BulkLoader:
         log.info("bulk_load_started", table=self.table_name, csv_file=str(csv_file))
 
         try:
-            with get_bulk_load_connection(self.postgres_settings, self.table_name) as conn:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
                 cursor = conn.cursor()
 
                 # Open CSV file and use COPY FROM
@@ -307,6 +415,7 @@ class BulkLoader:
         csv_files: list[Path] | Path,
         delimiter: str = ",",
         null_string: str = "\\N",
+        table_def: TableDefinition | None = None,
     ) -> int:
         """
         Complete load process with index management.
@@ -315,6 +424,7 @@ class BulkLoader:
             csv_files: Single CSV file or list of CSV files
             delimiter: Field delimiter
             null_string: String representing NULL
+            table_def: Source table definition for auto-creating table if it doesn't exist
 
         Returns:
             int: Number of rows loaded
@@ -322,6 +432,11 @@ class BulkLoader:
         log.info("load_with_index_management_started", table=self.table_name)
 
         try:
+            # Ensure table exists (auto-create if table_def provided)
+            table_created = self.ensure_table_exists(table_def)
+            if table_created:
+                log.info("table_auto_created", table=self.table_name)
+
             # Drop indexes if configured
             if self.drop_indexes:
                 self.drop_table_indexes()
@@ -366,7 +481,7 @@ class BulkLoader:
         log.info("analyzing_table", table=self.table_name)
 
         try:
-            with get_bulk_load_connection(self.postgres_settings, self.table_name) as conn:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
                 cursor = conn.cursor()
                 cursor.execute(f"ANALYZE {self.table_name}")
                 conn.commit()
@@ -381,7 +496,7 @@ class BulkLoader:
         log.warning("truncating_table", table=self.table_name)
 
         try:
-            with get_bulk_load_connection(self.postgres_settings, self.table_name) as conn:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
                 cursor = conn.cursor()
                 cursor.execute(f"TRUNCATE TABLE {self.table_name}")
                 conn.commit()

@@ -15,13 +15,51 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class DB2Settings(BaseSettings):
     """DB2 z/OS connection settings."""
 
-    model_config = SettingsConfigDict(env_prefix="DB2_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="DB2_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     database: str = Field(..., description="DB2 database name")
     hostname: str = Field(..., description="DB2 z/OS hostname or IP")
     port: int = Field(default=446, description="DB2 port (typically 446)")
     uid: str = Field(..., description="DB2 user ID")
     pwd: str = Field(..., description="DB2 password", repr=False)
+    jdbc_driver_path: str | None = Field(
+        default=None, description="Path to DB2 JDBC driver JAR file (for JDBC connections)"
+    )
+    use_mock: bool = Field(
+        default=False, description="Force mock DB2 connection for testing (no real database required)"
+    )
+
+    @field_validator("port")
+    @classmethod
+    def validate_port(cls, v: int) -> int:
+        if not 1 <= v <= 65535:
+            raise ValueError("Port must be between 1 and 65535")
+        return v
+
+
+class SSHTunnelSettings(BaseSettings):
+    """SSH tunnel settings for PostgreSQL access."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SSH_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    tunnel_enabled: bool = Field(default=False, description="Enable SSH tunnel for PostgreSQL")
+    host: str = Field(default="localhost", description="SSH server hostname")
+    port: int = Field(default=22, description="SSH server port")
+    user: str = Field(default="", description="SSH username")
+    password: str | None = Field(default=None, description="SSH password", repr=False)
+    key_file: str | None = Field(default=None, description="Path to SSH private key file")
 
     @field_validator("port")
     @classmethod
@@ -34,7 +72,13 @@ class DB2Settings(BaseSettings):
 class PostgresSettings(BaseSettings):
     """PostgreSQL target database settings."""
 
-    model_config = SettingsConfigDict(env_prefix="PG_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="PG_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     host: str = Field(default="localhost", description="PostgreSQL hostname")
     port: int = Field(default=5432, description="PostgreSQL port")
@@ -49,20 +93,44 @@ class PostgresSettings(BaseSettings):
             raise ValueError("Port must be between 1 and 65535")
         return v
 
-    def connection_string(self) -> str:
-        """Generate PostgreSQL connection string."""
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+    def connection_string(self, host: str | None = None, port: int | None = None) -> str:
+        """
+        Generate PostgreSQL connection string.
+
+        Args:
+            host: Override host (useful for SSH tunnel local endpoint)
+            port: Override port (useful for SSH tunnel local port)
+        """
+        conn_host = host or self.host
+        conn_port = port or self.port
+        return f"postgresql://{self.user}:{self.password}@{conn_host}:{conn_port}/{self.database}"
 
 
 class MigrationSettings(BaseSettings):
     """Migration execution settings."""
 
-    model_config = SettingsConfigDict(case_sensitive=False)
+    model_config = SettingsConfigDict(
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     # Parallelism settings
     min_workers: int = Field(default=2, description="Minimum number of worker processes")
     max_workers: int = Field(default=20, description="Maximum number of worker processes")
     chunk_size: int = Field(default=500_000, description="Default rows per chunk for large tables")
+
+    # Loading settings
+    drop_indexes_threshold: int = Field(
+        default=1, description="Drop indexes if table has more than this many CSV chunks"
+    )
+    truncate_before_load: bool = Field(
+        default=False, description="Truncate PostgreSQL tables before loading (for re-runs)"
+    )
+    skip_loading: bool = Field(
+        default=False, description="Skip loading phase (extraction only)"
+    )
 
     # Directory paths
     staging_dir: Path = Field(
@@ -130,6 +198,7 @@ class Settings(BaseSettings):
 
     db2: DB2Settings = Field(default_factory=DB2Settings)
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
+    ssh_tunnel: SSHTunnelSettings = Field(default_factory=SSHTunnelSettings)
     migration: MigrationSettings = Field(default_factory=MigrationSettings)
 
 

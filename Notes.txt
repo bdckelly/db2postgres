@@ -1,0 +1,8 @@
+# Full end to end process
+python -m src.orchestrator
+
+# Reset
+python utilities/reset_migration.py --all
+
+# Manual Copy
+python utilities/generate_create_table.py utilities/SYSCOLUMNS_202601231305.csv PS_INSTALLATION PSF8DEV

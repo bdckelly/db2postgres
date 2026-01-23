@@ -155,7 +155,7 @@ Extract PeopleSoft schema from DB2 catalog tables and convert to PostgreSQL DDL:
 
 ```bash
 # Option 1: All-in-one command (extract + convert)
-python -m src.schema --full
+python -m src.schema full --output schema/postgres/
 
 # Option 2: Step-by-step
 # Extract schema from PeopleSoft catalog

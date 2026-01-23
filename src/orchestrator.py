@@ -84,7 +84,8 @@ class MigrationOrchestrator:
         self.total_tables = 0
         self.completed_tables = 0
         self.failed_tables = 0
-        self.total_rows = 0
+        self.total_rows_extracted = 0
+        self.total_rows_loaded = 0
 
         # Shutdown flag
         self.shutdown_requested = False
@@ -133,8 +134,8 @@ class MigrationOrchestrator:
             try:
                 table_def = extractor.extract_table_definition(table_name)
 
-                # Create extraction task
-                task = create_extraction_task(table_name, table_def)
+                # Create extraction task with resume flag
+                task = create_extraction_task(table_name, table_def, resume=self.resume)
                 self.task_queue.put(task)
 
             except Exception as e:
@@ -211,11 +212,13 @@ class MigrationOrchestrator:
 
                 if result.success:
                     self.completed_tables += 1
-                    self.total_rows += result.rows_extracted
+                    self.total_rows_extracted += result.rows_extracted
+                    self.total_rows_loaded += result.rows_loaded
                     log.info(
                         "table_completed",
                         table=result.table_name,
-                        rows=result.rows_extracted,
+                        rows_extracted=result.rows_extracted,
+                        rows_loaded=result.rows_loaded,
                         duration=result.duration_seconds,
                         worker=result.worker_id,
                     )
@@ -259,7 +262,8 @@ class MigrationOrchestrator:
         table.add_row("Workers", f"{len(self.workers)} active")
         table.add_row("CPU", f"{metrics.cpu_percent:.1f}%")
         table.add_row("Memory", f"{metrics.memory_percent:.1f}%")
-        table.add_row("Total Rows", f"{self.total_rows:,}")
+        table.add_row("Rows Extracted", f"{self.total_rows_extracted:,}")
+        table.add_row("Rows Loaded", f"{self.total_rows_loaded:,}")
 
         if self.failed_tables > 0:
             table.add_row("Failed", f"{self.failed_tables}", style="red")
@@ -374,7 +378,8 @@ class MigrationOrchestrator:
         if self.failed_tables > 0:
             console.print(f"[red]Failed: {self.failed_tables}[/red]")
 
-        console.print(f"Total Rows Extracted: {self.total_rows:,}")
+        console.print(f"Total Rows Extracted: {self.total_rows_extracted:,}")
+        console.print(f"Total Rows Loaded: {self.total_rows_loaded:,}")
 
         # Resource summary
         console.print("\n" + self.resource_monitor.format_performance_summary())
@@ -388,3 +393,71 @@ class MigrationOrchestrator:
                 for checkpoint in failed_checkpoints:
                     console.print(f"  - {checkpoint.table}: {checkpoint.error}")
                 console.print()
+
+
+def main() -> None:
+    """Main entry point for orchestrator CLI."""
+    import argparse
+
+    from src.utils.logging_config import setup_logging
+
+    parser = argparse.ArgumentParser(
+        description="PS82-DB2 to PostgreSQL Migration Orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from checkpoints (skip completed tables)",
+    )
+    parser.add_argument(
+        "--tables",
+        type=str,
+        help="Comma-separated list of specific tables to migrate",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=None,
+        help="Override log level from settings",
+    )
+
+    args = parser.parse_args()
+
+    # Load settings
+    from config.settings import get_settings
+
+    settings = get_settings()
+
+    # Override log level if specified
+    if args.log_level:
+        settings.migration.log_level = args.log_level
+
+    # Setup logging
+    setup_logging(
+        log_level=settings.migration.log_level,
+        log_format=settings.migration.log_format,
+        log_file=settings.migration.log_dir / "orchestrator.log",
+    )
+
+    # Parse table list if provided
+    table_names = None
+    if args.tables:
+        table_names = [t.strip() for t in args.tables.split(",")]
+
+    # Create and run orchestrator
+    orchestrator = MigrationOrchestrator(
+        settings=settings,
+        table_names=table_names,
+        resume=args.resume,
+    )
+
+    success = orchestrator.run()
+
+    # Exit with appropriate code
+    raise SystemExit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()

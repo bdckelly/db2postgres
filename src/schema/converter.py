@@ -212,8 +212,12 @@ class SchemaConverter:
         """
         log.info("converting_table", table_name=table_def.sql_table_name, fields=len(table_def.fields))
 
-        # Convert table name
-        pg_table_name = self.convert_table_name(table_def.sql_table_name)
+        # Convert table name - use PS_{record_name} if sql_table_name is empty
+        source_table_name = table_def.sql_table_name
+        if not source_table_name or source_table_name.strip() == "":
+            source_table_name = f"PS_{table_def.record_name}"
+
+        pg_table_name = self.convert_table_name(source_table_name)
 
         # Convert fields
         pg_fields = []

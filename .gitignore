@@ -21,6 +21,9 @@ wheels/
 *.egg
 MANIFEST
 
+# Drivers
+drivers/
+
 # Virtual environments
 venv/
 ENV/
@@ -58,6 +61,10 @@ schema/extracted/**
 schema/postgres/**
 !schema/extracted/.gitkeep
 !schema/postgres/.gitkeep
+
+# Utility files
+utilities/*.csv
+utilities/*.sql
 
 # Environment variables
 .env

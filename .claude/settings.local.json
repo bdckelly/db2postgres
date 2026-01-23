@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(test:*)",
+      "Bash(python:*)",
+      "Bash(./venv/Scripts/python.exe:*)",
+      "Bash(./venv/Scripts/pip.exe install:*)",
+      "Bash(curl:*)",
+      "Bash(powershell -Command \"Invoke-WebRequest -Uri ''https://repo1.maven.org/maven2/com/ibm/db2/jcc/11.5.9.0/jcc-11.5.9.0.jar'' -OutFile ''D:\\\\Development\\\\db2postgres\\\\drivers\\\\db2jcc.jar''\")",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(java -version:*)",
+      "Bash(where:*)",
+      "Bash(ls:*)",
+      "Bash(pip install:*)",
+      "Bash(C:Usersbrian.pyenvpyenv-winshimspython test_pg_connection.py)",
+      "Bash(\"C:\\\\Users\\\\brian\\\\.pyenv\\\\pyenv-win\\\\shims\\\\python\" test_pg_connection.py)",
+      "Bash(py test_pg_connection.py)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}
