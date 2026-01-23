@@ -2,9 +2,10 @@
 Main CLI entry point for PS82-DB2-to-Postgres migration tool.
 
 Usage:
-    python -m src                         # Run full migration
-    python -m src --resume                # Resume from checkpoint
-    python -m src --tables PS_VOUCHER,... # Migrate specific tables
+    python -m src --mode development      # Run full migration (dev mode)
+    python -m src --mode production       # Run full migration (prod mode)
+    python -m src --mode development --resume  # Resume from checkpoint
+    python -m src --mode development --tables PS_VOUCHER,...  # Specific tables
 """
 
 import argparse
@@ -26,17 +27,20 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full migration with dynamic parallelism
-  python -m src
+  # Full migration (development mode - truncates existing data)
+  python -m src --mode development
+
+  # Full migration (production mode - errors if data exists)
+  python -m src --mode production
 
   # Resume interrupted migration
-  python -m src --resume
+  python -m src --mode development --resume
 
   # Migrate specific tables only
-  python -m src --tables PS_VOUCHER,PS_VCHR_LINE,PS_PAYMENT_TBL
+  python -m src --mode development --tables PS_VOUCHER,PS_VCHR_LINE,PS_PAYMENT_TBL
 
   # Override parallelism bounds
-  python -m src --min-workers 5 --max-workers 15
+  python -m src --mode development --min-workers 5 --max-workers 15
 
   # Extract schema only (use src.schema module)
   python -m src.schema full --output schema/postgres/
@@ -76,6 +80,25 @@ Examples:
         help="Chunk size for large tables (default: from config)",
     )
 
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO). Use WARNING for minimal output.",
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["production", "development"],
+        required=True,
+        help="REQUIRED: 'production' (if-exists defaults to error) or 'development' (if-exists defaults to truncate)",
+    )
+
+    parser.add_argument(
+        "--if-exists",
+        choices=["truncate", "error", "append"],
+        help="How to handle existing data. Overrides mode default. Options: 'truncate', 'error', 'append'",
+    )
+
     args = parser.parse_args()
 
     # Load settings
@@ -90,6 +113,15 @@ Examples:
 
     if args.chunk_size:
         settings.migration.chunk_size = args.chunk_size
+
+    if args.log_level:
+        settings.migration.log_level = args.log_level
+
+    # --mode is required, so always set it
+    settings.migration.mode = args.mode
+
+    if args.if_exists:
+        settings.migration.if_exists = args.if_exists
 
     # Initialize logging
     setup_logging(
@@ -142,6 +174,7 @@ def print_banner(settings, args) -> None:
     console.print("=" * 80)
 
     console.print(f"\n[yellow]Configuration:[/yellow]")
+    console.print(f"  Mode: {settings.migration.mode.upper()} (if-exists: {settings.migration.effective_if_exists})")
     console.print(f"  DB2: {settings.db2.hostname}:{settings.db2.port}/{settings.db2.database}")
     console.print(f"  PostgreSQL: {settings.postgres.host}:{settings.postgres.port}/{settings.postgres.database}")
     console.print(f"  Workers: {settings.migration.min_workers}-{settings.migration.max_workers}")

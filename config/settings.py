@@ -116,6 +116,12 @@ class MigrationSettings(BaseSettings):
         extra="ignore",
     )
 
+    # Environment mode - controls default behaviors for safety
+    mode: Literal["production", "development"] = Field(
+        default="development",
+        description="Environment mode: 'production' (safe defaults) or 'development' (convenient defaults)"
+    )
+
     # Parallelism settings
     min_workers: int = Field(default=2, description="Minimum number of worker processes")
     max_workers: int = Field(default=20, description="Maximum number of worker processes")
@@ -128,12 +134,21 @@ class MigrationSettings(BaseSettings):
     drop_indexes_threshold: int = Field(
         default=1, description="Drop indexes if table has more than this many CSV chunks (file mode only)"
     )
-    truncate_before_load: bool = Field(
-        default=False, description="Truncate PostgreSQL tables before loading (for re-runs)"
+    if_exists: Literal["truncate", "error", "append"] | None = Field(
+        default=None,
+        description="How to handle existing data. If not set, defaults based on mode: production='error', development='truncate'"
     )
     skip_loading: bool = Field(
         default=False, description="Skip loading phase (extraction only, file mode only)"
     )
+
+    @property
+    def effective_if_exists(self) -> Literal["truncate", "error", "append"]:
+        """Get the effective if_exists value based on mode if not explicitly set."""
+        if self.if_exists is not None:
+            return self.if_exists
+        # Default based on mode: production is safe (error), development is convenient (truncate)
+        return "error" if self.mode == "production" else "truncate"
 
     # Directory paths
     staging_dir: Path = Field(

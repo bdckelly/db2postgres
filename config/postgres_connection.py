@@ -140,13 +140,14 @@ class PostgresQueryError(Exception):
     pass
 
 
-def start_ssh_tunnel(ssh_settings: SSHTunnelSettings, pg_port: int) -> Any:
+def start_ssh_tunnel(ssh_settings: SSHTunnelSettings, pg_port: int, force_new: bool = False) -> Any:
     """
     Start SSH tunnel for PostgreSQL connection.
 
     Args:
         ssh_settings: SSH tunnel configuration
         pg_port: PostgreSQL port to forward
+        force_new: If True, close existing tunnel and create a new one
 
     Returns:
         SSHTunnelForwarder instance
@@ -162,10 +163,36 @@ def start_ssh_tunnel(ssh_settings: SSHTunnelSettings, pg_port: int) -> Any:
             "Install with: pip install sshtunnel"
         )
 
-    # Return existing tunnel if already running
+    # Close existing tunnel if force_new requested
+    if force_new and _ssh_tunnel is not None:
+        try:
+            _ssh_tunnel.stop()
+        except Exception:
+            pass
+        _ssh_tunnel = None
+
+    # Return existing tunnel if already running and healthy
     if _ssh_tunnel is not None and _ssh_tunnel.is_active:
-        log.info("ssh_tunnel_already_active", local_port=_ssh_tunnel.local_bind_port)
-        return _ssh_tunnel
+        # Verify tunnel is actually working by checking transport
+        try:
+            transport = _ssh_tunnel.ssh_transport
+            if transport and transport.is_active():
+                log.debug("ssh_tunnel_already_active", local_port=_ssh_tunnel.local_bind_port)
+                return _ssh_tunnel
+            else:
+                log.warning("ssh_tunnel_transport_inactive", message="Recreating tunnel")
+                try:
+                    _ssh_tunnel.stop()
+                except Exception:
+                    pass
+                _ssh_tunnel = None
+        except Exception as e:
+            log.warning("ssh_tunnel_health_check_failed", error=str(e), message="Recreating tunnel")
+            try:
+                _ssh_tunnel.stop()
+            except Exception:
+                pass
+            _ssh_tunnel = None
 
     try:
         log.info(
@@ -188,11 +215,12 @@ def start_ssh_tunnel(ssh_settings: SSHTunnelSettings, pg_port: int) -> Any:
                 "Set SSH_PASSWORD or SSH_KEY_FILE in .env"
             )
 
-        # Create tunnel
+        # Create tunnel with keepalive to prevent session timeouts
         _ssh_tunnel = SSHTunnelForwarder(
             (ssh_settings.host, ssh_settings.port),
             ssh_username=ssh_settings.user,
             remote_bind_address=("localhost", pg_port),
+            set_keepalive=30.0,  # Send keepalive every 30 seconds
             **ssh_kwargs,
         )
 
@@ -233,6 +261,9 @@ def create_connection(
     """
     Create PostgreSQL connection, optionally through SSH tunnel.
 
+    If connection through an existing tunnel fails, automatically retries
+    with a fresh tunnel.
+
     Args:
         settings: PostgreSQL connection settings
         ssh_settings: SSH tunnel settings (optional)
@@ -248,54 +279,88 @@ def create_connection(
         conninfo = settings.connection_string()
         return MockPostgresConnection(conninfo)
 
-    # Start SSH tunnel if enabled
-    tunnel = None
-    connect_host = settings.host
-    connect_port = settings.port
+    # Determine if using SSH tunnel
+    use_tunnel = ssh_settings and ssh_settings.tunnel_enabled
+    max_attempts = 2 if use_tunnel else 1  # Retry once with fresh tunnel if tunnel fails
 
-    if ssh_settings and ssh_settings.tunnel_enabled:
-        tunnel = start_ssh_tunnel(ssh_settings, settings.port)
-        connect_host = "127.0.0.1"  # Connect to local tunnel endpoint
-        connect_port = tunnel.local_bind_port
-        log.info(
-            "postgres_using_ssh_tunnel",
-            tunnel_local_port=connect_port,
-            remote_host=settings.host,
-            remote_port=settings.port,
-        )
+    last_error = None
+    for attempt in range(max_attempts):
+        # Start SSH tunnel if enabled
+        tunnel = None
+        connect_host = settings.host
+        connect_port = settings.port
 
-    try:
-        conninfo = settings.connection_string(host=connect_host, port=connect_port)
-        log.info(
-            "postgres_connection_attempt",
-            host=connect_host,
-            port=connect_port,
-            database=settings.database,
-            via_ssh_tunnel=tunnel is not None,
-        )
+        if use_tunnel:
+            # On retry, force a new tunnel
+            force_new = attempt > 0
+            if force_new:
+                log.info("ssh_tunnel_retry", message="Retrying with fresh SSH tunnel")
+            tunnel = start_ssh_tunnel(ssh_settings, settings.port, force_new=force_new)
+            connect_host = "127.0.0.1"  # Connect to local tunnel endpoint
+            connect_port = tunnel.local_bind_port
+            log.debug(
+                "postgres_using_ssh_tunnel",
+                tunnel_local_port=connect_port,
+                remote_host=settings.host,
+                remote_port=settings.port,
+            )
 
-        # Add connection timeout (10 seconds) to avoid hanging forever
-        conn = psycopg.connect(conninfo, connect_timeout=10)
+        try:
+            conninfo = settings.connection_string(host=connect_host, port=connect_port)
+            log.debug(
+                "postgres_connection_attempt",
+                host=connect_host,
+                port=connect_port,
+                database=settings.database,
+                via_ssh_tunnel=tunnel is not None,
+            )
 
-        log.info(
-            "postgres_connection_success",
-            host=settings.host,
-            database=settings.database,
-            via_ssh_tunnel=tunnel is not None,
-        )
-        return conn
+            # Add connection timeout (10 seconds) to avoid hanging forever
+            conn = psycopg.connect(conninfo, connect_timeout=10)
 
-    except Exception as e:
-        error_msg = f"Failed to connect to PostgreSQL: {e}"
-        log.error(
-            "postgres_connection_failed",
-            error=str(e),
-            host=connect_host,
-            port=connect_port,
-            database=settings.database,
-            via_ssh_tunnel=tunnel is not None,
-        )
-        raise PostgresConnectionError(error_msg) from e
+            log.debug(
+                "postgres_connection_success",
+                host=settings.host,
+                database=settings.database,
+                via_ssh_tunnel=tunnel is not None,
+            )
+            return conn
+
+        except Exception as e:
+            last_error = e
+            error_msg = str(e)
+
+            # Check if this looks like a tunnel failure that might be recoverable
+            tunnel_error_indicators = [
+                "SSH session not active",
+                "server closed the connection unexpectedly",
+                "connection refused",
+                "could not receive data from server",
+            ]
+            is_tunnel_error = use_tunnel and any(
+                indicator.lower() in error_msg.lower() for indicator in tunnel_error_indicators
+            )
+
+            if is_tunnel_error and attempt < max_attempts - 1:
+                log.warning(
+                    "postgres_connection_tunnel_error",
+                    error=error_msg,
+                    message="Will retry with fresh tunnel",
+                )
+                continue
+
+            log.error(
+                "postgres_connection_failed",
+                error=error_msg,
+                host=connect_host,
+                port=connect_port,
+                database=settings.database,
+                via_ssh_tunnel=tunnel is not None,
+            )
+            raise PostgresConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
+
+    # Should not reach here, but just in case
+    raise PostgresConnectionError(f"Failed to connect to PostgreSQL: {last_error}") from last_error
 
 
 @contextmanager

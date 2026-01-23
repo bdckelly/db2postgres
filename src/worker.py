@@ -466,7 +466,7 @@ class ExtractionWorker(multiprocessing.Process):
         rows_loaded = loader.stream_load(
             row_generator=db2_row_generator(),
             table_def=table_def,
-            truncate_first=self.settings.migration.truncate_before_load,
+            if_exists=self.settings.migration.effective_if_exists,
         )
 
         # rows_extracted equals rows_loaded in streaming mode

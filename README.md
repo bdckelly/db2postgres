@@ -134,6 +134,7 @@ PG_PASSWORD=your_password
 MIN_WORKERS=2
 MAX_WORKERS=20
 CHUNK_SIZE=500000
+MODE=development        # production or development
 ```
 
 ## Quick Start
@@ -152,7 +153,7 @@ cp .env.example .env
 python -m src.schema --full
 
 # 3. Run migration
-python -m src --tables PS_XLATTABLE  # Start with small table
+python -m src --mode development --tables PS_XLATTABLE  # Start with small table
 ```
 
 ## Usage
@@ -203,20 +204,33 @@ Generated: schema/postgres/all_indexes.sql (4,523 indexes)
 
 ### Phase 2: Data Migration
 
-Run the full migration with dynamic parallelism:
+Run the full migration with dynamic parallelism. **Note: `--mode` is required.**
 
 ```bash
-# Full migration (all tables)
-python -m src
+# Full migration - development mode (truncates existing data)
+python -m src --mode development
+
+# Full migration - production mode (errors if data exists)
+python -m src --mode production
 
 # Migrate specific tables only
-python -m src --tables PS_VOUCHER,PS_VCHR_LINE,PS_PAYMENT_TBL
+python -m src --mode development --tables PS_VOUCHER,PS_VCHR_LINE,PS_PAYMENT_TBL
 
 # Resume from checkpoint after interruption
-python -m src --resume
+python -m src --mode development --resume
 
 # Fixed worker count (disable dynamic parallelism)
-python -m src --min-workers 5 --max-workers 5
+python -m src --mode development --min-workers 5 --max-workers 5
+
+# Minimal logging for production (reduces log file size)
+python -m src --mode production --log-level WARNING
+
+# Verbose logging for troubleshooting
+python -m src --mode development --log-level DEBUG
+
+# Handle existing data (overrides mode default)
+python -m src --mode production --if-exists truncate  # Override to truncate in prod
+python -m src --mode development --if-exists error    # Override to error in dev
 ```
 
 Progress display during migration:
@@ -287,7 +301,7 @@ python -m src.schema extract --tables PS_XLATTABLE
 psql -h localhost -d ps82_archive -f schema/postgres/tables/PS_XLATTABLE.sql
 
 # 3. Migrate data
-python -m src --tables PS_XLATTABLE
+python -m src --mode development --tables PS_XLATTABLE
 
 # Expected output:
 # Building work queue...
@@ -325,7 +339,7 @@ print(f'Key fields: {[f.field_name for f in table_def.fields if f.is_key]}')
 # Key fields: ['BUSINESS_UNIT', 'JOURNAL_ID', 'JOURNAL_LINE']
 
 # 2. Run migration (will auto-chunk based on size)
-python -m src --tables PS_JRNL_LN
+python -m src --mode development --tables PS_JRNL_LN
 
 # Expected output with chunking:
 # [10:35:20] chunking_strategy_determined table=PS_JRNL_LN chunks=50 strategy=NumericRangeChunkStrategy
@@ -360,7 +374,7 @@ Simulate interruption and resume:
 
 ```bash
 # 1. Start migration
-python -m src
+python -m src --mode development
 
 # 2. Interrupt with Ctrl+C after a few tables complete
 # Expected output:
@@ -382,7 +396,7 @@ cat data/checkpoints/PS_VOUCHER.json
 # }
 
 # 4. Resume from checkpoint
-python -m src --resume
+python -m src --mode development --resume
 
 # Expected output:
 # Loading checkpoints...
@@ -398,7 +412,7 @@ What to do when tables fail:
 
 ```bash
 # 1. Run migration
-python -m src
+python -m src --mode development
 
 # 2. Check for failures in summary
 # Expected output:
@@ -422,11 +436,11 @@ cat data/checkpoints/PS_PROBLEM_TABLE.json
 # }
 
 # 4. Retry failed tables only
-python -m src --tables PS_PROBLEM_TABLE,PS_ANOTHER_TABLE
+python -m src --mode development --tables PS_PROBLEM_TABLE,PS_ANOTHER_TABLE
 
 # 5. Or reset and retry
 rm data/checkpoints/PS_PROBLEM_TABLE.json
-python -m src --tables PS_PROBLEM_TABLE
+python -m src --mode development --tables PS_PROBLEM_TABLE
 ```
 
 ### Scenario 5: Monitor Resource Usage
@@ -435,7 +449,7 @@ Watch resource adaptation in action:
 
 ```bash
 # Terminal 1: Run migration with verbose logging
-LOG_LEVEL=DEBUG python -m src
+python -m src --mode development --log-level DEBUG
 
 # Terminal 2: Monitor system resources
 watch -n 1 'ps aux | grep python; free -h; mpstat 1 1'
@@ -528,7 +542,7 @@ Override automatic chunking strategy:
 # Or set custom chunk size for specific tables
 
 # Example: Force date-based chunking for audit tables
-python -m src --tables PS_AUDIT_TBL --chunk-size 100000
+python -m src --mode development --tables PS_AUDIT_TBL --chunk-size 100000
 ```
 
 ### Selective Migration
@@ -537,7 +551,7 @@ Migrate tables by pattern:
 
 ```bash
 # All voucher-related tables
-python -m src --tables $(python -c "
+python -m src --mode development --tables $(python -c "
 from src.schema.extractor import SchemaExtractor
 from config.settings import Settings
 extractor = SchemaExtractor(Settings().db2)
@@ -552,7 +566,7 @@ Enable detailed performance tracking:
 
 ```bash
 # Run with profiling
-LOG_LEVEL=DEBUG python -m src --tables PS_LARGE_TABLE > profile.log 2>&1
+python -m src --mode development --log-level DEBUG --tables PS_LARGE_TABLE > profile.log 2>&1
 
 # Analyze timing
 grep 'duration' profile.log | jq '{table: .table, duration: .duration}' | sort -k2 -n
@@ -606,16 +620,18 @@ Process tables in logical groups:
 #!/bin/bash
 # scripts/batch_migrate.sh
 
+MODE=${1:-development}  # Pass 'production' or 'development' as argument
+
 # Group 1: Reference tables (small, fast)
-python -m src --tables PS_XLATTABLE,PS_INSTALLATION,PS_COUNTRY_TBL
+python -m src --mode $MODE --tables PS_XLATTABLE,PS_INSTALLATION,PS_COUNTRY_TBL
 echo "Reference tables complete"
 
 # Group 2: Master data (medium)
-python -m src --tables PS_VENDOR,PS_CUSTOMER,PS_ITEM
+python -m src --mode $MODE --tables PS_VENDOR,PS_CUSTOMER,PS_ITEM
 echo "Master data complete"
 
 # Group 3: Transactional (large, chunked)
-python -m src --tables PS_VOUCHER,PS_VCHR_LINE,PS_JRNL_LN
+python -m src --mode $MODE --tables PS_VOUCHER,PS_VCHR_LINE,PS_JRNL_LN
 echo "Transactional data complete"
 
 # Validate each group
@@ -652,7 +668,7 @@ jobs:
           DB2_HOSTNAME: ${{ secrets.DB2_HOSTNAME }}
           DB2_UID: ${{ secrets.DB2_UID }}
           DB2_PWD: ${{ secrets.DB2_PWD }}
-        run: python -m src
+        run: python -m src --mode production
 
       - name: Validate
         run: python -m src.loading validate --mode counts
@@ -679,6 +695,40 @@ The orchestrator dynamically adjusts worker count based on:
 - DB2 response time (detect mainframe saturation)
 - PostgreSQL throughput (detect target bottleneck)
 
+### Environment Mode (Required)
+
+The `--mode` flag is **required** and controls migration behavior:
+
+```bash
+python -m src --mode production     # Safe defaults for production
+python -m src --mode development    # Convenient defaults for testing
+```
+
+| Mode | Default if-exists | Use Case |
+|------|-------------------|----------|
+| `production` | `error` | Production safety - fails if tables have existing data |
+| `development` | `truncate` | Development/testing - clears tables for idempotent runs |
+
+### Handling Existing Data
+
+The `--if-exists` flag overrides the mode default when needed:
+
+```bash
+python -m src --mode production --if-exists truncate  # Override to truncate in prod
+python -m src --mode development --if-exists error    # Override to error in dev
+```
+
+| if-exists | Behavior | Use Case |
+|-----------|----------|----------|
+| `truncate` | Clear table before loading | Development, testing, re-runs |
+| `error` | Fail if table has data | Production safety, prevent accidental overwrites |
+| `append` | Add to existing data | Incremental loads (not typical for this tool) |
+
+**Recommended workflow:**
+- **Development**: Use `--mode development` - tables are automatically truncated on each run
+- **Production**: Use `--mode production` to fail-safe against accidental data overwrites
+- **Re-runs in production**: Use `--mode production --if-exists truncate` to explicitly reload data
+
 ### Chunking Strategy
 
 Tables are processed based on size:
@@ -689,15 +739,29 @@ Tables are processed based on size:
 
 ### Logging Configuration
 
-Control logging via environment variables:
+Control logging via command line or environment variables:
 
 ```bash
-# Log level
+# Command line (recommended)
+python -m src --log-level WARNING
+
+# Environment variable
 LOG_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 
 # Log format
 LOG_FORMAT=console  # console (colored) or json (production)
 ```
+
+**Log level recommendations:**
+
+| Level | Use Case | Log File Size |
+|-------|----------|---------------|
+| `WARNING` | Production runs, minimal output | Very small (errors/warnings only) |
+| `INFO` | Normal operation, track progress | Small (~25 lines per table) |
+| `DEBUG` | Troubleshooting connection issues | Large (all connection details) |
+
+- **For large migrations**, use `--log-level WARNING` to prevent log files from growing too large.
+- **For troubleshooting**, use `--log-level DEBUG` to see all connection attempts and internal operations.
 
 Logs are written to:
 - Console (stdout)

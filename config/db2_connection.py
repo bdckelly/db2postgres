@@ -330,7 +330,7 @@ def _create_ibm_db_connection(
 
     for attempt in range(1, max_retries + 1):
         try:
-            log.info(
+            log.debug(
                 "db2_connection_attempt",
                 attempt=attempt,
                 max_retries=max_retries,
@@ -343,7 +343,7 @@ def _create_ibm_db_connection(
             ibm_conn = ibm_db.connect(conn_str, "", "")
             conn = ibm_db_dbi.Connection(ibm_conn)
 
-            log.info(
+            log.debug(
                 "db2_connection_success",
                 hostname=settings.hostname,
                 database=settings.database,
@@ -364,7 +364,7 @@ def _create_ibm_db_connection(
             if attempt < max_retries:
                 # Exponential backoff
                 sleep_time = retry_delay * (2 ** (attempt - 1))
-                log.info("retrying_connection", delay_seconds=sleep_time)
+                log.debug("retrying_connection", delay_seconds=sleep_time)
                 time.sleep(sleep_time)
 
     # All retries exhausted
@@ -421,7 +421,7 @@ def _create_jdbc_connection(
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
-            log.info(
+            log.debug(
                 "db2_connection_attempt",
                 attempt=attempt,
                 max_retries=max_retries,
@@ -461,7 +461,7 @@ def _create_jdbc_connection(
             except Exception as verify_err:
                 log.warning("jdbc_connection_verify_failed", error=str(verify_err))
 
-            log.info(
+            log.debug(
                 "db2_connection_success",
                 hostname=settings.hostname,
                 database=settings.database,
@@ -482,7 +482,7 @@ def _create_jdbc_connection(
 
             if attempt < max_retries:
                 sleep_time = retry_delay * (2 ** (attempt - 1))
-                log.info("retrying_connection", delay_seconds=sleep_time)
+                log.debug("retrying_connection", delay_seconds=sleep_time)
                 time.sleep(sleep_time)
 
     error_msg = f"Failed to connect to DB2 via JDBC after {max_retries} attempts: {last_error}"

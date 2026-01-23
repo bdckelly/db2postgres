@@ -87,6 +87,9 @@ class MigrationOrchestrator:
         self.total_rows_extracted = 0
         self.total_rows_loaded = 0
 
+        # Timing
+        self.start_time: float | None = None
+
         # Shutdown flag
         self.shutdown_requested = False
 
@@ -279,6 +282,9 @@ class MigrationOrchestrator:
         """
         log.info("migration_started")
 
+        # Track start time
+        self.start_time = time.time()
+
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -372,6 +378,14 @@ class MigrationOrchestrator:
         console.print("\n" + "=" * 80)
         console.print("[bold cyan]MIGRATION SUMMARY[/bold cyan]")
         console.print("=" * 80)
+
+        # Calculate and display elapsed time
+        if self.start_time:
+            elapsed_seconds = time.time() - self.start_time
+            hours, remainder = divmod(int(elapsed_seconds), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            console.print(f"Total Run Time: {hours:02d}:{minutes:02d}:{seconds:02d}")
+
         console.print(f"Total Tables: {self.total_tables}")
         console.print(f"[green]Completed: {self.completed_tables}[/green]")
 
@@ -422,6 +436,17 @@ def main() -> None:
         default=None,
         help="Override log level from settings",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["production", "development"],
+        required=True,
+        help="REQUIRED: 'production' (if-exists defaults to error) or 'development' (if-exists defaults to truncate)",
+    )
+    parser.add_argument(
+        "--if-exists",
+        choices=["truncate", "error", "append"],
+        help="How to handle existing data. Overrides mode default.",
+    )
 
     args = parser.parse_args()
 
@@ -433,6 +458,12 @@ def main() -> None:
     # Override log level if specified
     if args.log_level:
         settings.migration.log_level = args.log_level
+
+    # --mode is required, so always set it
+    settings.migration.mode = args.mode
+
+    if args.if_exists:
+        settings.migration.if_exists = args.if_exists
 
     # Setup logging
     setup_logging(

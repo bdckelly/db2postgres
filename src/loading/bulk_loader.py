@@ -567,6 +567,18 @@ class StreamingLoader:
             log.error("table_exists_check_failed", table=self.table_name, error=str(e))
             return False
 
+    def get_row_count(self) -> int:
+        """Get current row count in target table."""
+        try:
+            with get_bulk_load_connection(self.postgres_settings, self.ssh_settings, table_name=self.table_name) as conn:
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM {self.table_name}")
+                result = cursor.fetchone()
+                return result[0] if result else 0
+        except Exception as e:
+            log.warning("row_count_check_failed", table=self.table_name, error=str(e))
+            return 0
+
     def create_table(self, table_def: TableDefinition) -> None:
         """Create table in PostgreSQL from TableDefinition."""
         log.info("creating_table", table=self.table_name, source_table=table_def.sql_table_name)
@@ -621,7 +633,7 @@ class StreamingLoader:
         row_generator,
         table_def: TableDefinition | None = None,
         columns: list[str] | None = None,
-        truncate_first: bool = False,
+        if_exists: str = "truncate",
     ) -> int:
         """
         Stream data from generator directly into PostgreSQL using COPY protocol.
@@ -633,19 +645,25 @@ class StreamingLoader:
             row_generator: Generator yielding tuples of row data
             table_def: Table definition for auto-creating table if needed
             columns: Optional list of column names (for COPY column list)
-            truncate_first: Whether to truncate table before loading
+            if_exists: How to handle existing data:
+                - 'truncate': Clear table before loading (default, idempotent)
+                - 'error': Fail if table has existing data
+                - 'append': Add to existing data
 
         Returns:
             int: Number of rows loaded
+
+        Raises:
+            BulkLoadError: If if_exists='error' and table has data
 
         Example:
             >>> def extract_from_db2():
             ...     for row in db2_cursor.fetchall():
             ...         yield transform_row(row)
             >>> loader = StreamingLoader(pg_settings, "ps_voucher")
-            >>> rows = loader.stream_load(extract_from_db2())
+            >>> rows = loader.stream_load(extract_from_db2(), if_exists="truncate")
         """
-        log.info("stream_load_started", table=self.table_name)
+        log.info("stream_load_started", table=self.table_name, if_exists=if_exists)
 
         self.rows_loaded = 0
         self.bad_rows = 0
@@ -656,9 +674,20 @@ class StreamingLoader:
             if table_created:
                 log.info("table_auto_created", table=self.table_name)
 
-            # Truncate if requested
-            if truncate_first and self.table_exists():
-                self.truncate_table()
+            # Handle existing data based on if_exists setting
+            if self.table_exists() and not table_created:
+                existing_rows = self.get_row_count()
+                if existing_rows > 0:
+                    if if_exists == "error":
+                        raise BulkLoadError(
+                            f"Table {self.table_name} has {existing_rows} existing rows. "
+                            f"Use --if-exists=truncate to clear data or --if-exists=append to add to it."
+                        )
+                    elif if_exists == "truncate":
+                        log.info("truncating_existing_data", table=self.table_name, existing_rows=existing_rows)
+                        self.truncate_table()
+                    elif if_exists == "append":
+                        log.warning("appending_to_existing_data", table=self.table_name, existing_rows=existing_rows)
 
             # Build COPY command
             if columns:

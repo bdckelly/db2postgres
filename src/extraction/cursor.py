@@ -3,22 +3,19 @@ DB2 cursor management for data extraction.
 
 Provides cursor handling with:
 - WITH UR (uncommitted read) for snapshot consistency
-- BATCHED FETCHING: Fetches data in chunks (default 10,000 rows) to reduce
-  network round-trips
+- TRUE STREAMING with ibm_db: Row-by-row fetching with near-zero memory overhead
+- BATCHED FALLBACK for JDBC: Materializes rows due to result set limitations
 - Retry logic for transient failures
 - Progress tracking
 
-JDBC Compatibility Note:
-JDBC drivers close result sets when Python generators yield control back to
-the caller. This means we cannot do "true" streaming where rows flow directly
-from DB2 to PostgreSQL. Instead, we:
-1. Fetch ALL data in batches (reduces peak memory vs single fetchall())
-2. Materialize all rows to Python types while connection is open
-3. Close DB2 connection
-4. THEN yield rows to the caller (safe from JDBC result set closure)
+Driver Selection:
+- When ibm_db is available: Uses ibm_db.fetch_tuple() for true row-by-row streaming.
+  This is the optimal path with minimal memory usage.
+- When using JDBC (jaydebeapi): Falls back to fetchall() because JDBC closes result
+  sets when Python generators yield. Rows are materialized before yielding.
 
-For very large tables (10M+ rows), use SQL-level chunking with WHERE clauses
-to keep memory manageable.
+For very large tables (10M+ rows), SQL-level chunking with WHERE clauses keeps
+memory manageable regardless of which driver is used.
 """
 
 import time
@@ -26,19 +23,29 @@ from typing import Any, Generator
 
 import structlog
 
-from config.db2_connection import DB2ConnectionError, create_connection, get_db2_connection
+from config.db2_connection import (
+    DB2ConnectionError,
+    HAS_IBM_DB,
+    build_connection_string,
+    create_connection,
+    get_db2_connection,
+)
 from config.settings import DB2Settings
+
+# Import ibm_db for true streaming (only if available)
+if HAS_IBM_DB:
+    import ibm_db
 
 log = structlog.get_logger()
 
 
 class ExtractionCursor:
     """
-    Managed cursor for data extraction with batch fetching and error handling.
+    Managed cursor for data extraction with streaming and error handling.
 
     Handles:
-    - Batch fetching to avoid loading entire table in memory
-    - WITH HOLD cursors to prevent closure on commit
+    - True streaming with ibm_db (row-by-row, near-zero memory)
+    - Fallback batch fetching for JDBC drivers
     - WITH UR for snapshot reads
     - Automatic retry on transient errors
     - Progress tracking
@@ -57,7 +64,7 @@ class ExtractionCursor:
         Args:
             db2_settings: DB2 connection settings
             table_name: Table being extracted
-            batch_size: Number of rows to fetch per batch
+            batch_size: Number of rows to fetch per batch (JDBC fallback only)
             max_retries: Maximum retries for transient errors
         """
         self.db2_settings = db2_settings
@@ -66,10 +73,14 @@ class ExtractionCursor:
         self.max_retries = max_retries
         self.rows_fetched = 0
 
+        # Determine if we can use true streaming
+        self._use_streaming = HAS_IBM_DB and not db2_settings.use_mock
+
         log.info(
             "extraction_cursor_initialized",
             table=table_name,
             batch_size=batch_size,
+            streaming_enabled=self._use_streaming,
         )
 
     @staticmethod
@@ -123,7 +134,7 @@ class ExtractionCursor:
         attempt: int = 1,
     ) -> None:
         """
-        Execute query with retry logic.
+        Execute query with retry logic (for DB-API cursors).
 
         Args:
             cursor: DB2 cursor
@@ -181,52 +192,151 @@ class ExtractionCursor:
                 )
                 raise DB2ConnectionError(f"Query execution failed: {e}") from e
 
-    def extract_chunk(
+    def _extract_chunk_streaming(
         self,
         chunk_id: int,
-        where_clause: str,
-        params: tuple[Any, ...] = (),
-        columns: list[str] | None = None,
+        query: str,
     ) -> Generator[tuple[Any, ...], None, None]:
         """
-        Extract data for a single chunk with batched streaming.
+        Extract data using true row-by-row streaming with ibm_db.
 
-        Uses fetchmany() to fetch data in batches, reducing network round-trips
-        while maintaining low memory usage. Each batch is processed and yielded
-        row-by-row before fetching the next batch.
+        This is the optimal extraction path - rows flow directly from DB2 to the
+        caller with near-zero memory overhead. Only available when ibm_db driver
+        is installed.
 
         Args:
             chunk_id: Chunk identifier
-            where_clause: WHERE clause for this chunk
-            params: Parameters for WHERE clause
-            columns: Optional list of columns to select (default: *)
+            query: Full SQL query to execute
+
+        Yields:
+            tuple: Rows from the table, one at a time
+        """
+        log.info(
+            "streaming_extraction_started",
+            table=self.table_name,
+            chunk_id=chunk_id,
+            mode="ibm_db_streaming",
+        )
+
+        conn = None
+        stmt = None
+        self.rows_fetched = 0
+
+        try:
+            # Create raw ibm_db connection (not the DB-API wrapper)
+            conn_str = build_connection_string(self.db2_settings)
+
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    conn = ibm_db.connect(conn_str, "", "")
+                    log.debug("ibm_db_raw_connection_established", attempt=attempt)
+                    break
+                except Exception as e:
+                    if attempt < self.max_retries:
+                        wait_time = 2 ** (attempt - 1)
+                        log.warning(
+                            "ibm_db_connection_failed_retrying",
+                            attempt=attempt,
+                            wait_time=wait_time,
+                            error=str(e),
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        raise DB2ConnectionError(f"Failed to connect after {self.max_retries} attempts: {e}") from e
+
+            # Execute query
+            stmt = ibm_db.exec_immediate(conn, query)
+
+            if stmt is False:
+                error_msg = ibm_db.stmt_errormsg()
+                raise DB2ConnectionError(f"Query execution failed: {error_msg}")
+
+            log.debug("ibm_db_query_executed", table=self.table_name, chunk_id=chunk_id)
+
+            # Stream rows one at a time - this is the magic!
+            # ibm_db.fetch_tuple() returns False when no more rows
+            while True:
+                row = ibm_db.fetch_tuple(stmt)
+                if row is False:
+                    break
+
+                self.rows_fetched += 1
+                yield row
+
+                # Log progress periodically
+                if self.rows_fetched % 100_000 == 0:
+                    log.debug(
+                        "streaming_progress",
+                        table=self.table_name,
+                        chunk_id=chunk_id,
+                        rows_streamed=self.rows_fetched,
+                    )
+
+            log.info(
+                "streaming_extraction_completed",
+                table=self.table_name,
+                chunk_id=chunk_id,
+                total_rows=self.rows_fetched,
+            )
+
+        except Exception as e:
+            log.error(
+                "streaming_extraction_failed",
+                table=self.table_name,
+                chunk_id=chunk_id,
+                rows_fetched=self.rows_fetched,
+                error=str(e),
+            )
+            raise
+
+        finally:
+            # Clean up statement and connection
+            if stmt:
+                try:
+                    ibm_db.free_stmt(stmt)
+                except Exception:
+                    pass
+
+            if conn:
+                try:
+                    ibm_db.close(conn)
+                    log.debug("ibm_db_connection_closed")
+                except Exception:
+                    pass
+
+    def _extract_chunk_jdbc_fallback(
+        self,
+        chunk_id: int,
+        query: str,
+        params: tuple[Any, ...] = (),
+    ) -> Generator[tuple[Any, ...], None, None]:
+        """
+        Extract data using JDBC fallback (materializes all rows).
+
+        JDBC drivers close result sets when Python generators yield, so we must:
+        1. Fetch ALL rows while connection is open
+        2. Convert to Python types
+        3. Close connection
+        4. Then yield rows
+
+        Args:
+            chunk_id: Chunk identifier
+            query: Full SQL query to execute
+            params: Query parameters
 
         Yields:
             tuple: Rows from the table
-
-        Example:
-            >>> cursor = ExtractionCursor(db2_settings, "PS_VOUCHER")
-            >>> for row in cursor.extract_chunk(0, "business_unit = ?", ("US001",)):
-            ...     process_row(row)
         """
         log.info(
-            "chunk_extraction_started",
+            "jdbc_fallback_extraction_started",
             table=self.table_name,
             chunk_id=chunk_id,
-            where_clause=where_clause[:100],
-            batch_size=self.batch_size,
+            mode="jdbc_fallback",
         )
 
-        self.rows_fetched = 0
-        column_list = ", ".join(columns) if columns else "*"
-
-        # Build query with WITH UR for uncommitted read
-        query = f"SELECT {column_list} FROM {self.table_name} WHERE {where_clause} WITH UR"
-
-        # Manually manage connection to keep it open during generator iteration
         conn = None
         cursor = None
-        batches_processed = 0
+        self.rows_fetched = 0
 
         try:
             conn = create_connection(self.db2_settings)
@@ -235,21 +345,13 @@ class ExtractionCursor:
             # Execute query with retry logic
             self.execute_with_retry(cursor, query, params)
 
-            # JDBC COMPATIBILITY:
-            #
-            # JDBC drivers have strict result set handling - fetchmany() often
-            # doesn't work reliably. We use fetchall() which is universally supported.
-            #
-            # For truly huge tables (10M+ rows), use SQL-level chunking with
-            # WHERE clauses to process smaller subsets.
-
             log.debug("fetching_all_rows", table=self.table_name, chunk_id=chunk_id)
 
-            # Fetch ALL rows at once - most reliable with JDBC
+            # Fetch ALL rows at once - required for JDBC compatibility
             all_rows = cursor.fetchall()
 
             log.info(
-                "fetch_completed",
+                "jdbc_fetch_completed",
                 table=self.table_name,
                 chunk_id=chunk_id,
                 total_rows=len(all_rows),
@@ -280,16 +382,15 @@ class ExtractionCursor:
                 yield python_row
 
             log.info(
-                "chunk_extraction_completed",
+                "jdbc_fallback_extraction_completed",
                 table=self.table_name,
                 chunk_id=chunk_id,
                 total_rows=self.rows_fetched,
-                batches=batches_processed,
             )
 
         except Exception as e:
             log.error(
-                "chunk_extraction_failed",
+                "jdbc_fallback_extraction_failed",
                 table=self.table_name,
                 chunk_id=chunk_id,
                 rows_fetched=self.rows_fetched,
@@ -310,6 +411,67 @@ class ExtractionCursor:
                     conn.close()
                 except Exception:
                     pass
+
+    def extract_chunk(
+        self,
+        chunk_id: int,
+        where_clause: str,
+        params: tuple[Any, ...] = (),
+        columns: list[str] | None = None,
+    ) -> Generator[tuple[Any, ...], None, None]:
+        """
+        Extract data for a single chunk.
+
+        Automatically selects the best extraction method:
+        - ibm_db available: True row-by-row streaming (near-zero memory)
+        - JDBC fallback: Materializes all rows before yielding
+
+        Args:
+            chunk_id: Chunk identifier
+            where_clause: WHERE clause for this chunk
+            params: Parameters for WHERE clause
+            columns: Optional list of columns to select (default: *)
+
+        Yields:
+            tuple: Rows from the table
+
+        Example:
+            >>> cursor = ExtractionCursor(db2_settings, "PS_VOUCHER")
+            >>> for row in cursor.extract_chunk(0, "business_unit = ?", ("US001",)):
+            ...     process_row(row)
+        """
+        log.info(
+            "chunk_extraction_started",
+            table=self.table_name,
+            chunk_id=chunk_id,
+            where_clause=where_clause[:100],
+            streaming=self._use_streaming,
+        )
+
+        column_list = ", ".join(columns) if columns else "*"
+
+        # Build query with WITH UR for uncommitted read
+        query = f"SELECT {column_list} FROM {self.table_name} WHERE {where_clause} WITH UR"
+
+        if self._use_streaming:
+            # Use true streaming with ibm_db
+            # Note: ibm_db doesn't support parameterized queries with exec_immediate,
+            # so we need to format params into the query for simple cases
+            if params:
+                # For streaming, we need to inline the parameters
+                # This is safe because params come from our chunking logic, not user input
+                formatted_query = query
+                for param in params:
+                    if isinstance(param, str):
+                        formatted_query = formatted_query.replace("?", f"'{param}'", 1)
+                    else:
+                        formatted_query = formatted_query.replace("?", str(param), 1)
+                yield from self._extract_chunk_streaming(chunk_id, formatted_query)
+            else:
+                yield from self._extract_chunk_streaming(chunk_id, query)
+        else:
+            # Fall back to JDBC-compatible extraction
+            yield from self._extract_chunk_jdbc_fallback(chunk_id, query, params)
 
     def extract_all(
         self,
