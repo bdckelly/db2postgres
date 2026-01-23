@@ -113,6 +113,25 @@ class TableDefinition:
         )
 
 
+@dataclass
+class ViewDefinition:
+    """Definition of a SQL view from PeopleSoft catalog."""
+
+    record_name: str  # PeopleSoft record name (e.g., VOUCHER_VW)
+    sql_view_name: str  # Actual DB2 view name (e.g., PS_VOUCHER_VW)
+    description: str | None = None
+    db2_sql_text: str = ""  # Raw DB2 SQL from PSSQLTEXTDEFN
+    fields: list[FieldDefinition] = field(default_factory=list)
+    effdt: str | None = None  # Effective date of the SQL definition
+    record_type: int = 1  # Always 1 for SQL Views
+
+    def __repr__(self) -> str:
+        return (
+            f"ViewDefinition(record_name='{self.record_name}', "
+            f"sql_view_name='{self.sql_view_name}', sql_length={len(self.db2_sql_text)})"
+        )
+
+
 class SchemaExtractor:
     """
     Extract PeopleSoft schema from catalog tables.
@@ -485,3 +504,280 @@ class SchemaExtractor:
         except Exception as e:
             log.error("all_tables_extraction_failed", error=str(e))
             raise
+
+    # -------------------------------------------------------------------------
+    # View Extraction Methods
+    # -------------------------------------------------------------------------
+
+    def extract_view_list(self, view_names: list[str] | None = None) -> list[str]:
+        """
+        Extract list of SQL views from PSRECDEFN.
+
+        Args:
+            view_names: Optional list of specific view names to extract.
+                       If None, extracts all SQL views.
+
+        Returns:
+            list[str]: List of view record names
+
+        Example:
+            >>> extractor = SchemaExtractor(db2_settings)
+            >>> views = extractor.extract_view_list()
+            >>> print(len(views))
+            234
+        """
+        log.info("extracting_view_list", specific_views=view_names is not None)
+
+        query = """
+            SELECT RECNAME
+            FROM PSRECDEFN
+            WHERE RECTYPE = 1
+        """
+
+        # Add filter for specific views if provided
+        if view_names:
+            placeholders = ",".join(["?" for _ in view_names])
+            query += f" AND RECNAME IN ({placeholders})"
+
+        query += " ORDER BY RECNAME"
+
+        try:
+            with get_db2_cursor(self.db2_settings) as cursor:
+                if view_names:
+                    cursor.execute(query + " WITH UR", tuple(view_names))
+                else:
+                    cursor.execute(query + " WITH UR")
+
+                rows = cursor.fetchall()
+                view_list = [_jdbc_value_to_python(row[0]) for row in rows]
+
+                log.info("view_list_extracted", count=len(view_list))
+                return view_list
+
+        except Exception as e:
+            log.error("view_list_extraction_failed", error=str(e))
+            raise
+
+    def extract_view_sql(self, record_name: str) -> tuple[str, str | None]:
+        """
+        Extract view SQL from PSSQLTEXTDEFN.
+
+        PeopleSoft stores view SQL in PSSQLTEXTDEFN with:
+        - SQLID = record name
+        - SQLTYPE = 2 (for views)
+        - DBTYPE = 1 (for DB2 platform)
+        - SQLTEXT may span multiple rows (concatenated by SEQNUM order)
+
+        Args:
+            record_name: PeopleSoft record name (SQLID)
+
+        Returns:
+            tuple[str, str | None]: (concatenated_sql_text, effdt)
+        """
+        log.debug("extracting_view_sql", record_name=record_name)
+
+        # First, get the most recent EFFDT for this view
+        effdt_query = """
+            SELECT MAX(EFFDT)
+            FROM PSSQLTEXTDEFN
+            WHERE SQLID = ?
+            AND SQLTYPE = 2
+            AND DBTYPE = 1
+            WITH UR
+        """
+
+        try:
+            with get_db2_cursor(self.db2_settings) as cursor:
+                # Get max EFFDT
+                cursor.execute(effdt_query, (record_name,))
+                effdt_row = cursor.fetchone()
+
+                if not effdt_row or effdt_row[0] is None:
+                    log.warning("view_sql_not_found", record_name=record_name)
+                    return ("", None)
+
+                max_effdt = _jdbc_value_to_python(effdt_row[0])
+
+                # Now get all SQLTEXT rows for this EFFDT, ordered by SEQNUM
+                sql_query = """
+                    SELECT SQLTEXT, SEQNUM
+                    FROM PSSQLTEXTDEFN
+                    WHERE SQLID = ?
+                    AND SQLTYPE = 2
+                    AND DBTYPE = 1
+                    AND EFFDT = ?
+                    ORDER BY SEQNUM ASC
+                    WITH UR
+                """
+
+                cursor.execute(sql_query, (record_name, max_effdt))
+                rows = cursor.fetchall()
+
+                if not rows:
+                    log.warning("view_sql_text_empty", record_name=record_name)
+                    return ("", str(max_effdt) if max_effdt else None)
+
+                # Concatenate SQL text from all rows
+                sql_parts = []
+                for row in rows:
+                    sql_text = _jdbc_value_to_python(row[0])
+                    if sql_text:
+                        sql_parts.append(sql_text)
+
+                full_sql = "".join(sql_parts)
+
+                log.debug(
+                    "view_sql_extracted",
+                    record_name=record_name,
+                    parts=len(sql_parts),
+                    length=len(full_sql),
+                )
+                return (full_sql, str(max_effdt) if max_effdt else None)
+
+        except Exception as e:
+            log.error("view_sql_extraction_failed", record_name=record_name, error=str(e))
+            raise
+
+    def extract_view_definition(self, record_name: str) -> ViewDefinition:
+        """
+        Extract complete view definition including SQL text.
+
+        Args:
+            record_name: PeopleSoft record name
+
+        Returns:
+            ViewDefinition: Complete view definition
+
+        Example:
+            >>> extractor = SchemaExtractor(db2_settings)
+            >>> view_def = extractor.extract_view_definition("VOUCHER_VW")
+            >>> print(view_def.sql_view_name)
+            PS_VOUCHER_VW
+        """
+        log.info("extracting_view_definition", record_name=record_name)
+
+        try:
+            # Get view metadata from PSRECDEFN (same structure as tables)
+            metadata = self.extract_table_metadata(record_name)
+            if not metadata:
+                raise ValueError(f"View {record_name} not found in PSRECDEFN")
+
+            # Verify it's actually a view
+            if metadata.get("record_type") != 1:
+                log.warning(
+                    "not_a_view",
+                    record_name=record_name,
+                    record_type=metadata.get("record_type"),
+                )
+
+            # Get field list from PSRECFIELD (views have logical fields)
+            field_list = self.extract_field_list(record_name)
+
+            # Build field definitions
+            fields = []
+            for field_name, field_num, use_edit, subrecord in field_list:
+                # Get physical field details from PSDBFIELD
+                field_details = self.extract_field_details(field_name)
+
+                if not field_details:
+                    log.warning(
+                        "field_details_missing",
+                        record_name=record_name,
+                        field_name=field_name,
+                    )
+                    continue
+
+                field_def = FieldDefinition(
+                    field_name=field_name,
+                    field_type=field_details.get("field_type", 0),
+                    length=field_details.get("length"),
+                    decimal_pos=field_details.get("decimal_pos"),
+                    field_num=field_num,
+                    is_key=False,  # Views don't have keys
+                    use_edit=use_edit,
+                    subrecord=subrecord,
+                )
+                fields.append(field_def)
+
+            # Get view SQL from PSSQLTEXTDEFN
+            db2_sql, effdt = self.extract_view_sql(record_name)
+
+            # Create view definition
+            view_def = ViewDefinition(
+                record_name=metadata["record_name"],
+                sql_view_name=metadata["sql_table_name"],
+                description=metadata.get("description"),
+                db2_sql_text=db2_sql,
+                fields=fields,
+                effdt=effdt,
+                record_type=1,
+            )
+
+            log.info(
+                "view_definition_extracted",
+                record_name=record_name,
+                fields=len(fields),
+                sql_length=len(db2_sql),
+            )
+            return view_def
+
+        except Exception as e:
+            log.error("view_definition_extraction_failed", record_name=record_name, error=str(e))
+            raise
+
+    def extract_all_views(
+        self, view_names: list[str] | None = None
+    ) -> dict[str, ViewDefinition]:
+        """
+        Extract definitions for all views (or specified subset).
+
+        Args:
+            view_names: Optional list of specific views to extract
+
+        Returns:
+            dict[str, ViewDefinition]: Dictionary mapping record name to view definition
+
+        Example:
+            >>> extractor = SchemaExtractor(db2_settings)
+            >>> views = extractor.extract_all_views(["VOUCHER_VW", "VENDOR_VW"])
+            >>> print(len(views))
+            2
+        """
+        log.info("extracting_all_views", specific_views=view_names is not None)
+
+        try:
+            # Get view list
+            if view_names:
+                views_to_extract = view_names
+            else:
+                views_to_extract = self.extract_view_list()
+
+            # Extract each view
+            view_definitions: dict[str, ViewDefinition] = {}
+            for i, record_name in enumerate(views_to_extract, 1):
+                try:
+                    log.info(
+                        "extracting_view",
+                        record_name=record_name,
+                        progress=f"{i}/{len(views_to_extract)}",
+                    )
+                    view_def = self.extract_view_definition(record_name)
+                    view_definitions[record_name] = view_def
+
+                except Exception as e:
+                    log.error(
+                        "view_extraction_failed",
+                        record_name=record_name,
+                        error=str(e),
+                    )
+                    # Continue with next view
+                    continue
+
+            log.info("all_views_extracted", success_count=len(view_definitions))
+            return view_definitions
+
+        except Exception as e:
+            log.error("all_views_extraction_failed", error=str(e))
+            raise
+
+

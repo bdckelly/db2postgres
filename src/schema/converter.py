@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 
 import structlog
 
-from src.schema.extractor import FieldDefinition, TableDefinition
+import re
+
+from src.schema.extractor import FieldDefinition, TableDefinition, ViewDefinition
 from src.utils.ps_types import (
     PSFieldType,
     convert_db2_type_to_postgres,
@@ -79,6 +81,216 @@ class PostgresTableDefinition:
             if f.field_name.lower() == field_name_lower:
                 return f
         return None
+
+
+@dataclass
+class PostgresViewDefinition:
+    """PostgreSQL view definition."""
+
+    view_name: str  # Lowercase PostgreSQL view name
+    postgres_sql_text: str  # Converted PostgreSQL SQL
+    fields: list[PostgresFieldDefinition] = field(default_factory=list)
+    comment: str | None = None
+    dependencies: list[str] = field(default_factory=list)  # Referenced tables/views
+
+    def get_field(self, field_name: str) -> PostgresFieldDefinition | None:
+        """Get field by name (case-insensitive)."""
+        field_name_lower = field_name.lower()
+        for f in self.fields:
+            if f.field_name.lower() == field_name_lower:
+                return f
+        return None
+
+
+class ViewSQLConverter:
+    """
+    Convert DB2 SQL to PostgreSQL SQL.
+
+    Handles function name conversions, table name case changes,
+    and removal of DB2-specific hints.
+    """
+
+    # DB2 to PostgreSQL function mappings
+    FUNCTION_MAPPINGS: dict[str, str] = {
+        "SUBSTR": "SUBSTRING",
+        "VALUE": "COALESCE",
+        "DIGITS": "TO_CHAR",
+        "STRIP": "TRIM",
+        "POSSTR": "POSITION",
+        "LENGTH": "LENGTH",  # Same in PostgreSQL
+        "UPPER": "UPPER",  # Same in PostgreSQL
+        "LOWER": "LOWER",  # Same in PostgreSQL
+        "LTRIM": "LTRIM",  # Same in PostgreSQL
+        "RTRIM": "RTRIM",  # Same in PostgreSQL
+    }
+
+    def __init__(self, use_lowercase: bool = True):
+        """
+        Initialize SQL converter.
+
+        Args:
+            use_lowercase: If True, convert table names to lowercase
+        """
+        self.use_lowercase = use_lowercase
+        # Pattern to match PS_* table names
+        self._table_pattern = re.compile(r"\bPS_[A-Z0-9_]+\b", re.IGNORECASE)
+        # Pattern for date functions
+        self._year_pattern = re.compile(r"\bYEAR\s*\(([^)]+)\)", re.IGNORECASE)
+        self._month_pattern = re.compile(r"\bMONTH\s*\(([^)]+)\)", re.IGNORECASE)
+        self._day_pattern = re.compile(r"\bDAY\s*\(([^)]+)\)", re.IGNORECASE)
+        # Pattern for FETCH FIRST
+        self._fetch_first_pattern = re.compile(
+            r"\bFETCH\s+FIRST\s+(\d+)\s+ROWS?\s+ONLY\b", re.IGNORECASE
+        )
+
+    def convert_sql(self, db2_sql: str) -> str:
+        """
+        Convert DB2 SQL statement to PostgreSQL.
+
+        Args:
+            db2_sql: DB2 SQL statement
+
+        Returns:
+            str: PostgreSQL-compatible SQL statement
+        """
+        if not db2_sql:
+            return ""
+
+        sql = db2_sql
+
+        # Step 1: Convert table names to lowercase
+        sql = self._convert_table_names(sql)
+
+        # Step 2: Convert function names
+        sql = self._convert_functions(sql)
+
+        # Step 3: Convert date extraction functions
+        sql = self._convert_date_functions(sql)
+
+        # Step 4: Convert CURRENT DATE/TIMESTAMP
+        sql = self._convert_current_date(sql)
+
+        # Step 5: Convert FETCH FIRST to LIMIT
+        sql = self._convert_fetch_first(sql)
+
+        # Step 6: Remove DB2 hints
+        sql = self._remove_db2_hints(sql)
+
+        # Step 7: Clean up whitespace
+        sql = self._clean_whitespace(sql)
+
+        return sql
+
+    def _convert_table_names(self, sql: str) -> str:
+        """Convert PS_* table names to lowercase if configured."""
+        if not self.use_lowercase:
+            return sql
+
+        def replace_table(match: re.Match) -> str:
+            return match.group(0).lower()
+
+        return self._table_pattern.sub(replace_table, sql)
+
+    def _convert_functions(self, sql: str) -> str:
+        """Convert DB2 function names to PostgreSQL equivalents."""
+        result = sql
+
+        for db2_func, pg_func in self.FUNCTION_MAPPINGS.items():
+            if db2_func != pg_func:
+                # Case-insensitive replacement of function names
+                pattern = re.compile(rf"\b{db2_func}\s*\(", re.IGNORECASE)
+                result = pattern.sub(f"{pg_func}(", result)
+
+        return result
+
+    def _convert_date_functions(self, sql: str) -> str:
+        """Convert DB2 YEAR/MONTH/DAY functions to PostgreSQL EXTRACT."""
+        result = sql
+
+        # YEAR(date) -> EXTRACT(YEAR FROM date)
+        result = self._year_pattern.sub(r"EXTRACT(YEAR FROM \1)", result)
+
+        # MONTH(date) -> EXTRACT(MONTH FROM date)
+        result = self._month_pattern.sub(r"EXTRACT(MONTH FROM \1)", result)
+
+        # DAY(date) -> EXTRACT(DAY FROM date)
+        result = self._day_pattern.sub(r"EXTRACT(DAY FROM \1)", result)
+
+        return result
+
+    def _convert_current_date(self, sql: str) -> str:
+        """Convert CURRENT DATE/TIMESTAMP to PostgreSQL syntax."""
+        result = sql
+
+        # CURRENT DATE -> CURRENT_DATE (no space)
+        result = re.sub(r"\bCURRENT\s+DATE\b", "CURRENT_DATE", result, flags=re.IGNORECASE)
+
+        # CURRENT TIMESTAMP -> CURRENT_TIMESTAMP (no space)
+        result = re.sub(
+            r"\bCURRENT\s+TIMESTAMP\b", "CURRENT_TIMESTAMP", result, flags=re.IGNORECASE
+        )
+
+        return result
+
+    def _convert_fetch_first(self, sql: str) -> str:
+        """Convert FETCH FIRST n ROWS ONLY to LIMIT n."""
+        return self._fetch_first_pattern.sub(r"LIMIT \1", sql)
+
+    def _remove_db2_hints(self, sql: str) -> str:
+        """Remove DB2-specific hints and clauses."""
+        result = sql
+
+        # Remove WITH UR (uncommitted read)
+        result = re.sub(r"\bWITH\s+UR\b", "", result, flags=re.IGNORECASE)
+
+        # Remove OPTIMIZE FOR n ROWS
+        result = re.sub(
+            r"\bOPTIMIZE\s+FOR\s+\d+\s+ROWS?\b", "", result, flags=re.IGNORECASE
+        )
+
+        # Remove FOR READ ONLY
+        result = re.sub(r"\bFOR\s+READ\s+ONLY\b", "", result, flags=re.IGNORECASE)
+
+        # Remove FOR FETCH ONLY
+        result = re.sub(r"\bFOR\s+FETCH\s+ONLY\b", "", result, flags=re.IGNORECASE)
+
+        return result
+
+    def _clean_whitespace(self, sql: str) -> str:
+        """Clean up extra whitespace."""
+        # Replace multiple spaces with single space
+        sql = re.sub(r"  +", " ", sql)
+        # Remove trailing whitespace from lines
+        sql = "\n".join(line.rstrip() for line in sql.split("\n"))
+        # Remove trailing whitespace from entire statement
+        sql = sql.strip()
+        return sql
+
+    def extract_dependencies(self, sql: str) -> list[str]:
+        """
+        Extract table/view names referenced in SQL.
+
+        Args:
+            sql: SQL statement
+
+        Returns:
+            list[str]: List of table/view names (lowercase if configured)
+        """
+        if not sql:
+            return []
+
+        matches = self._table_pattern.findall(sql)
+
+        # Remove duplicates and convert case
+        dependencies = []
+        seen = set()
+        for match in matches:
+            name = match.lower() if self.use_lowercase else match
+            if name not in seen:
+                seen.add(name)
+                dependencies.append(name)
+
+        return dependencies
 
 
 class SchemaConverter:
@@ -331,3 +543,84 @@ class SchemaConverter:
                     suggested_indexes.append((index_name, [pg_field_name]))
 
         return suggested_indexes
+
+    # -------------------------------------------------------------------------
+    # View Conversion Methods
+    # -------------------------------------------------------------------------
+
+    def convert_view(self, view_def: ViewDefinition) -> PostgresViewDefinition:
+        """
+        Convert view definition from DB2 to PostgreSQL.
+
+        Args:
+            view_def: Source view definition
+
+        Returns:
+            PostgresViewDefinition: PostgreSQL view definition
+        """
+        log.info("converting_view", view_name=view_def.sql_view_name)
+
+        # Convert view name
+        pg_view_name = self.convert_table_name(view_def.sql_view_name)
+
+        # Create SQL converter and convert the view SQL
+        sql_converter = ViewSQLConverter(use_lowercase=self.use_lowercase)
+        pg_sql = sql_converter.convert_sql(view_def.db2_sql_text)
+
+        # Extract dependencies (tables/views referenced in the SQL)
+        dependencies = sql_converter.extract_dependencies(view_def.db2_sql_text)
+
+        # Convert field definitions (for documentation/comments)
+        pg_fields = []
+        for field_def in view_def.fields:
+            pg_field = self.convert_field(field_def, is_key=False)
+            pg_fields.append(pg_field)
+
+        pg_view = PostgresViewDefinition(
+            view_name=pg_view_name,
+            postgres_sql_text=pg_sql,
+            fields=pg_fields,
+            comment=view_def.description,
+            dependencies=dependencies,
+        )
+
+        log.info(
+            "view_converted",
+            view_name=pg_view_name,
+            dependencies=len(dependencies),
+            sql_length=len(pg_sql),
+        )
+
+        return pg_view
+
+    def convert_all_views(
+        self, view_definitions: dict[str, ViewDefinition]
+    ) -> dict[str, PostgresViewDefinition]:
+        """
+        Convert all view definitions from DB2 to PostgreSQL.
+
+        Args:
+            view_definitions: Dictionary of source view definitions
+
+        Returns:
+            dict[str, PostgresViewDefinition]: Dictionary of PostgreSQL view definitions
+        """
+        log.info("converting_all_views", count=len(view_definitions))
+
+        pg_views = {}
+        for record_name, view_def in view_definitions.items():
+            try:
+                pg_view = self.convert_view(view_def)
+                pg_views[record_name] = pg_view
+
+            except Exception as e:
+                log.error(
+                    "view_conversion_failed",
+                    record_name=record_name,
+                    error=str(e),
+                )
+                # Continue with next view
+                continue
+
+        log.info("all_views_converted", success_count=len(pg_views))
+        return pg_views

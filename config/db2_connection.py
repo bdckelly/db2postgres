@@ -158,8 +158,17 @@ class MockDB2Cursor:
         # Return sample data based on query
         query_upper = query.upper()
 
-        # PSRECDEFN query (table list)
-        if "PSRECDEFN" in query_upper and "SELECT" in query_upper:
+        # PSRECDEFN query for views (RECTYPE = 1)
+        if "PSRECDEFN" in query_upper and "RECTYPE = 1" in query_upper:
+            self._results = [
+                ("VOUCHER_VW", "PS_VOUCHER_VW", "Voucher Summary View", 1),
+                ("VENDOR_VW", "PS_VENDOR_VW", "Vendor Summary View", 1),
+            ]
+            self._description = [
+                ("RECNAME",), ("SQLTABLENAME",), ("RECDESCR",), ("RECTYPE",)
+            ]
+        # PSRECDEFN query (table list - RECTYPE = 0)
+        elif "PSRECDEFN" in query_upper and "SELECT" in query_upper:
             self._results = [
                 ("XLATTABLE", "PS_XLATTABLE", "Translate Table", 0),
                 ("INSTALLATION", "PS_INSTALLATION", "Installation Table", 0),
@@ -170,40 +179,95 @@ class MockDB2Cursor:
             self._description = [
                 ("RECNAME",), ("SQLTABLENAME",), ("RECDESCR",), ("RECTYPE",)
             ]
+        # PSSQLTEXTDEFN query for view SQL (MAX EFFDT)
+        elif "PSSQLTEXTDEFN" in query_upper and "MAX(EFFDT)" in query_upper:
+            self._results = [("2024-01-01",)]
+            self._description = [("MAX_EFFDT",)]
+        # PSSQLTEXTDEFN query for view SQL text
+        elif "PSSQLTEXTDEFN" in query_upper and "SQLTEXT" in query_upper:
+            param_str = str(params).upper()
+            if "VOUCHER_VW" in param_str:
+                self._results = [
+                    ("SELECT BUSINESS_UNIT, VOUCHER_ID, INVOICE_ID, INVOICE_DT, GROSS_AMT FROM PS_VOUCHER WHERE VOUCHER_STATUS = 'C'", 1),
+                ]
+            elif "VENDOR_VW" in param_str:
+                self._results = [
+                    ("SELECT VENDOR_ID, VENDOR_NAME_SHORT, VENDOR_STATUS, YEAR(ADD_DT) AS ADD_YEAR FROM PS_VENDOR WHERE VENDOR_STATUS = 'A'", 1),
+                ]
+            else:
+                self._results = [
+                    ("SELECT 1 FROM SYSIBM.SYSDUMMY1", 1),
+                ]
+            self._description = [("SQLTEXT",), ("SEQNUM",)]
         # PSRECFIELD query (field definitions)
         elif "PSRECFIELD" in query_upper:
-            # Return fields for whichever table is being queried
-            if "VOUCHER" in str(params).upper() or "VOUCHER" in query_upper:
+            param_str = str(params).upper()
+            # Return fields for whichever table/view is being queried
+            if "VOUCHER_VW" in param_str:
                 self._results = [
-                    ("VOUCHER", "BUSINESS_UNIT", None, None, 1),
-                    ("VOUCHER", "VOUCHER_ID", None, None, 2),
-                    ("VOUCHER", "INVOICE_ID", None, None, 3),
-                    ("VOUCHER", "INVOICE_DT", None, None, 4),
-                    ("VOUCHER", "GROSS_AMT", None, None, 5),
+                    ("BUSINESS_UNIT", 1, None, None),
+                    ("VOUCHER_ID", 2, None, None),
+                    ("INVOICE_ID", 3, None, None),
+                    ("INVOICE_DT", 4, None, None),
+                    ("GROSS_AMT", 5, None, None),
                 ]
-            elif "XLATTABLE" in str(params).upper() or "XLATTABLE" in query_upper:
+            elif "VENDOR_VW" in param_str:
                 self._results = [
-                    ("XLATTABLE", "FIELDNAME", None, None, 1),
-                    ("XLATTABLE", "FIELDVALUE", None, None, 2),
-                    ("XLATTABLE", "EFFDT", None, None, 3),
-                    ("XLATTABLE", "XLATLONGNAME", None, None, 4),
+                    ("VENDOR_ID", 1, None, None),
+                    ("VENDOR_NAME_SHORT", 2, None, None),
+                    ("VENDOR_STATUS", 3, None, None),
+                    ("ADD_YEAR", 4, None, None),
+                ]
+            elif "VOUCHER" in param_str:
+                self._results = [
+                    ("BUSINESS_UNIT", 1, None, None),
+                    ("VOUCHER_ID", 2, None, None),
+                    ("INVOICE_ID", 3, None, None),
+                    ("INVOICE_DT", 4, None, None),
+                    ("GROSS_AMT", 5, None, None),
+                ]
+            elif "XLATTABLE" in param_str:
+                self._results = [
+                    ("FIELDNAME", 1, None, None),
+                    ("FIELDVALUE", 2, None, None),
+                    ("EFFDT", 3, None, None),
+                    ("XLATLONGNAME", 4, None, None),
                 ]
             else:
                 self._results = []
         # PSDBFIELD query (field types)
         elif "PSDBFIELD" in query_upper:
-            # Return field types for common fields
-            self._results = [
-                ("BUSINESS_UNIT", 0, 10, 0),
-                ("VOUCHER_ID", 0, 10, 0),
-                ("INVOICE_ID", 0, 30, 0),
-                ("INVOICE_DT", 4, 0, 0),
-                ("GROSS_AMT", 2, 28, 3),
-                ("FIELDNAME", 0, 18, 0),
-                ("FIELDVALUE", 0, 4, 0),
-                ("EFFDT", 4, 0, 0),
-                ("XLATLONGNAME", 1, 50, 0),
-            ]
+            # Return field types for common fields (including view fields)
+            param_str = str(params).upper()
+            if "VENDOR_ID" in param_str:
+                self._results = [("VENDOR_ID", 0, 10, 0)]
+            elif "VENDOR_NAME_SHORT" in param_str:
+                self._results = [("VENDOR_NAME_SHORT", 0, 40, 0)]
+            elif "VENDOR_STATUS" in param_str:
+                self._results = [("VENDOR_STATUS", 0, 1, 0)]
+            elif "ADD_YEAR" in param_str:
+                self._results = [("ADD_YEAR", 2, 4, 0)]
+            elif "BUSINESS_UNIT" in param_str:
+                self._results = [("BUSINESS_UNIT", 0, 10, 0)]
+            elif "VOUCHER_ID" in param_str:
+                self._results = [("VOUCHER_ID", 0, 10, 0)]
+            elif "INVOICE_ID" in param_str:
+                self._results = [("INVOICE_ID", 0, 30, 0)]
+            elif "INVOICE_DT" in param_str:
+                self._results = [("INVOICE_DT", 4, 0, 0)]
+            elif "GROSS_AMT" in param_str:
+                self._results = [("GROSS_AMT", 2, 28, 3)]
+            elif "FIELDNAME" in param_str:
+                self._results = [("FIELDNAME", 0, 18, 0)]
+            elif "FIELDVALUE" in param_str:
+                self._results = [("FIELDVALUE", 0, 4, 0)]
+            elif "EFFDT" in param_str:
+                self._results = [("EFFDT", 4, 0, 0)]
+            elif "XLATLONGNAME" in param_str:
+                self._results = [("XLATLONGNAME", 1, 50, 0)]
+            else:
+                # Default return for unknown fields
+                self._results = []
         # PSDBFLDLABL query (field labels)
         elif "PSDBFLDLABL" in query_upper:
             self._results = []

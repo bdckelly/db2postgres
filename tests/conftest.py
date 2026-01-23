@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from config.settings import DB2Settings, MigrationSettings, PostgresSettings, Settings
-from src.schema.extractor import FieldDefinition, TableDefinition
+from src.schema.extractor import FieldDefinition, TableDefinition, ViewDefinition
 from src.utils.ps_types import PSFieldType
 
 
@@ -448,6 +448,90 @@ def sample_job_data() -> list[tuple[Any, ...]]:
         ("E0002", 0, datetime(2021, 3, 15), 0, "ENG", "P0100"),
         ("E0002", 0, datetime(2023, 3, 15), 0, "SENG", "P0101"),
     ]
+
+
+@pytest.fixture
+def sample_view_def() -> ViewDefinition:
+    """Create sample view definition for PS_VOUCHER_VW."""
+    return ViewDefinition(
+        record_name="VOUCHER_VW",
+        sql_view_name="PS_VOUCHER_VW",
+        description="Voucher Summary View",
+        db2_sql_text="SELECT BUSINESS_UNIT, VOUCHER_ID, INVOICE_ID, INVOICE_DT, GROSS_AMT FROM PS_VOUCHER WHERE VOUCHER_STATUS = 'C'",
+        fields=[
+            FieldDefinition(
+                field_name="BUSINESS_UNIT",
+                field_type=PSFieldType.CHAR,
+                length=10,
+                is_key=False,
+            ),
+            FieldDefinition(
+                field_name="VOUCHER_ID",
+                field_type=PSFieldType.CHAR,
+                length=10,
+                is_key=False,
+            ),
+            FieldDefinition(
+                field_name="INVOICE_ID",
+                field_type=PSFieldType.CHAR,
+                length=30,
+                is_key=False,
+            ),
+            FieldDefinition(
+                field_name="INVOICE_DT",
+                field_type=PSFieldType.DATE,
+                is_key=False,
+            ),
+            FieldDefinition(
+                field_name="GROSS_AMT",
+                field_type=PSFieldType.NUMBER,
+                length=28,
+                decimal_pos=3,
+                is_key=False,
+            ),
+        ],
+        effdt="2024-01-01",
+        record_type=1,
+    )
+
+
+@pytest.fixture
+def sample_view_with_functions() -> ViewDefinition:
+    """Create sample view with DB2 functions that need conversion."""
+    return ViewDefinition(
+        record_name="VENDOR_VW",
+        sql_view_name="PS_VENDOR_VW",
+        description="Vendor Summary View",
+        db2_sql_text="SELECT VENDOR_ID, VENDOR_NAME_SHORT, VENDOR_STATUS, YEAR(ADD_DT) AS ADD_YEAR, SUBSTR(VENDOR_ID, 1, 3) AS VENDOR_PREFIX FROM PS_VENDOR WHERE VENDOR_STATUS = 'A' FETCH FIRST 100 ROWS ONLY WITH UR",
+        fields=[
+            FieldDefinition(
+                field_name="VENDOR_ID",
+                field_type=PSFieldType.CHAR,
+                length=10,
+                is_key=False,
+            ),
+            FieldDefinition(
+                field_name="VENDOR_NAME_SHORT",
+                field_type=PSFieldType.CHAR,
+                length=40,
+                is_key=False,
+            ),
+            FieldDefinition(
+                field_name="VENDOR_STATUS",
+                field_type=PSFieldType.CHAR,
+                length=1,
+                is_key=False,
+            ),
+            FieldDefinition(
+                field_name="ADD_YEAR",
+                field_type=PSFieldType.NUMBER,
+                length=4,
+                is_key=False,
+            ),
+        ],
+        effdt="2024-01-01",
+        record_type=1,
+    )
 
 
 @pytest.fixture
