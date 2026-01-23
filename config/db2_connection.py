@@ -14,6 +14,22 @@ from config.settings import DB2Settings
 
 # Try importing DB2 drivers in order of preference
 try:
+    # On Windows with Python 3.8+, we need to add the clidriver DLL directory
+    # before importing ibm_db, due to changes in DLL search behavior
+    import os
+    import sys
+
+    if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+        # Find clidriver bundled with ibm_db package
+        import importlib.util
+
+        ibm_db_spec = importlib.util.find_spec("ibm_db")
+        if ibm_db_spec and ibm_db_spec.origin:
+            site_packages = os.path.dirname(ibm_db_spec.origin)
+            clidriver_bin = os.path.join(site_packages, "clidriver", "bin")
+            if os.path.isdir(clidriver_bin):
+                os.add_dll_directory(clidriver_bin)
+
     import ibm_db
     import ibm_db_dbi
 

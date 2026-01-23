@@ -25,6 +25,23 @@ except ImportError:
     Cursor = None
 
 # SSH tunnel support
+# Compatibility shim for sshtunnel with paramiko 3.0+
+# paramiko 3.0 removed DSSKey (DSS/DSA deprecated), but sshtunnel 0.4.0 still references it
+try:
+    import paramiko
+
+    if not hasattr(paramiko, "DSSKey"):
+        # Create a dummy DSSKey class that will never match any key type
+        # This allows sshtunnel to import without errors
+        class _DummyDSSKey:
+            """Dummy class to satisfy sshtunnel's reference to removed paramiko.DSSKey"""
+
+            pass
+
+        paramiko.DSSKey = _DummyDSSKey
+except ImportError:
+    pass
+
 try:
     from sshtunnel import SSHTunnelForwarder
 

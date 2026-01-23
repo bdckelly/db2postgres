@@ -117,10 +117,10 @@ Examples:
         success = orchestrator.run()
 
         if success:
-            console.print("\n[bold green]✓ Migration completed successfully![/bold green]\n")
+            console.print("\n[bold green][OK] Migration completed successfully![/bold green]\n")
             return 0
         else:
-            console.print("\n[bold red]✗ Migration completed with errors.[/bold red]\n")
+            console.print("\n[bold red][FAILED] Migration completed with errors.[/bold red]\n")
             console.print("[yellow]Check logs for details. Failed tables can be retried.[/yellow]\n")
             return 1
 

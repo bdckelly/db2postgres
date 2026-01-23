@@ -7,7 +7,7 @@ name = "ps82-to-postgres"
 version = "0.1.0"
 description = "PeopleSoft 8.2 DB2 z/OS to PostgreSQL migration tool with dynamic parallelism"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"  # 3.13 has compatibility issues with ibm_db
 authors = [
     { name = "PS82 Migration Team" }
 ]
@@ -28,6 +28,9 @@ dependencies = [
     "rich>=13.0.0",            # Progress display and terminal UI
     "structlog>=23.0.0",       # Structured logging
     "python-dotenv>=1.0.0",    # .env file support
+    "colorama>=0.4.6; sys_platform == 'win32'",  # Required for colored console output on Windows
+    "sshtunnel>=0.4.0",        # SSH tunneling for PostgreSQL connections
+    "paramiko>=3.0.0",         # SSH library (3.0+ required for Python 3.12 compatibility)
 ]
 
 [project.optional-dependencies]

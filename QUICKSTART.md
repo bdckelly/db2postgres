@@ -6,11 +6,12 @@ Get up and running with PS82-to-Postgres migration in under 15 minutes.
 
 Before starting, ensure you have:
 
-- [ ] Python 3.11 or higher installed
+- [ ] Python 3.11 or 3.12 installed (Python 3.13 has compatibility issues with ibm_db)
 - [ ] Access to DB2 z/OS database (or use mock mode for testing)
 - [ ] PostgreSQL 12+ running and accessible
 - [ ] At least 10 GB free disk space for staging
-- [ ] DB2 client libraries (optional, can use mock mode initially)
+
+> **Note:** The `ibm_db` package includes a bundled DB2 CLI driver - no separate installation required.
 
 ## 5-Minute Setup
 
@@ -375,13 +376,35 @@ Before running in production:
 
 **Solution:**
 ```bash
-# Install DB2 client libraries first
-# Then reinstall ibm_db
+# Install ibm_db (includes bundled DB2 CLI driver)
 pip install ibm-db
 
 # Or use mock mode for testing:
 export DB2_USE_MOCK=true
 ```
+
+### Issue: "DLL load failed while importing ibm_db" (Windows)
+
+**Solution:**
+This usually indicates a Python version compatibility issue.
+
+```bash
+# Check Python version - use 3.11 or 3.12, NOT 3.13
+python --version
+
+# If using Python 3.13, switch to 3.12:
+# Using pyenv-win:
+pyenv install 3.12.9
+pyenv local 3.12.9
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -e .
+
+# Verify driver loads correctly
+python -c "from config.db2_connection import HAS_IBM_DB; print('ibm_db available:', HAS_IBM_DB)"
+```
+
+The project automatically configures DLL paths for the bundled driver on Windows.
 
 ### Issue: "Connection refused" to PostgreSQL
 

@@ -46,11 +46,12 @@ A Python-based migration tool for transferring PeopleSoft 8.2 databases from DB2
 
 ## Prerequisites
 
-- Python 3.11 or higher
+- Python 3.11 or 3.12 (3.13 has compatibility issues with ibm_db)
 - Access to DB2 z/OS database (PeopleSoft 8.2)
 - PostgreSQL 12 or higher (target database)
-- DB2 client libraries (for ibm_db)
 - Sufficient disk space for staging files
+
+> **Note:** The `ibm_db` package includes a bundled DB2 CLI driver, so no separate IBM Data Server Driver installation is required.
 
 ## Installation
 
@@ -80,21 +81,28 @@ For development with testing tools:
 pip install -e ".[dev]"
 ```
 
-### 4. Install DB2 client libraries
+### 4. Install DB2 driver (ibm_db)
 
-The `ibm_db` package requires DB2 client libraries. Follow the [ibm_db installation guide](https://github.com/ibmdb/python-ibmdb#installation) for your platform.
+The `ibm_db` Python package includes a bundled DB2 CLI driver. Simply install via pip:
 
-On Linux:
 ```bash
-# Download and extract IBM Data Server Driver Package
-# Set environment variables
-export IBM_DB_HOME=/path/to/dsdriver
-export LD_LIBRARY_PATH=$IBM_DB_HOME/lib:$LD_LIBRARY_PATH
+pip install ibm_db
 ```
 
-On Windows:
-- Install IBM Data Server Driver Package
-- Add `<install_dir>\bin` to PATH
+**Important notes:**
+
+- **Python version:** Use Python 3.11 or 3.12. Python 3.13 has known compatibility issues with `ibm_db`.
+- **Windows:** The project automatically configures DLL loading for the bundled driver. No additional setup required.
+- **Linux:** If you encounter library issues, you may need to set:
+  ```bash
+  export LD_LIBRARY_PATH=$VIRTUAL_ENV/lib/python3.12/site-packages/clidriver/lib:$LD_LIBRARY_PATH
+  ```
+
+To verify the driver is working:
+
+```bash
+python -c "from config.db2_connection import HAS_IBM_DB; print('ibm_db available:', HAS_IBM_DB)"
+```
 
 ### 5. Configure environment variables
 

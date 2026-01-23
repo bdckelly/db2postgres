@@ -17,7 +17,13 @@
       "Bash(py test_pg_connection.py)",
       "Bash(dir:*)",
       "Bash(findstr:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(pip show:*)",
+      "Bash(.\\\\venv\\\\Scripts\\\\python.exe -m pip show:*)",
+      "Bash(tasklist:*)",
+      "Bash(taskkill:*)",
+      "Bash(./venv/Scripts/pip.exe freeze:*)",
+      "Bash(./venv/Scripts/pip.exe show:*)"
     ]
   }
 }

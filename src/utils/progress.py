@@ -122,8 +122,24 @@ class CheckpointManager:
             with open(temp_path, "w", encoding="utf-8") as f:
                 json.dump(checkpoint.to_dict(), f, indent=2)
 
-            # Atomic rename
-            temp_path.replace(checkpoint_path)
+            # Atomic rename - on Windows, we may need to retry if the file is locked
+            import os
+            import sys
+            import time
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    if sys.platform == "win32" and checkpoint_path.exists():
+                        # On Windows, explicitly remove the target first to avoid access denied
+                        os.remove(checkpoint_path)
+                    temp_path.replace(checkpoint_path)
+                    break
+                except OSError as rename_error:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.1)  # Brief delay before retry
+                    else:
+                        raise rename_error
 
             log.debug(
                 "checkpoint_saved",
