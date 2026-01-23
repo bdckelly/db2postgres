@@ -13,3 +13,7 @@ Indexes
 Views
 Note: The current ExtractionCursor materializes rows due to JDBC limitations. For true row-by-row streaming with ibm_db, you'd need to use ibm_db.fetch_tuple() in a while loop instead of fetchall().
 Minimize logging
+DB2 Client
+
+# Run Time Notes
+The sweet spot for batch size is typically 5,000-10,000 rows as you mentioned. Larger batches provide diminishing returns and can cause memory pressure.

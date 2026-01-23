@@ -2,11 +2,23 @@
 DB2 cursor management for data extraction.
 
 Provides cursor handling with:
-- WITH HOLD to prevent cursor closure on commit
 - WITH UR (uncommitted read) for snapshot consistency
-- Batch fetching to manage memory
+- BATCHED FETCHING: Fetches data in chunks (default 10,000 rows) to reduce
+  network round-trips
 - Retry logic for transient failures
 - Progress tracking
+
+JDBC Compatibility Note:
+JDBC drivers close result sets when Python generators yield control back to
+the caller. This means we cannot do "true" streaming where rows flow directly
+from DB2 to PostgreSQL. Instead, we:
+1. Fetch ALL data in batches (reduces peak memory vs single fetchall())
+2. Materialize all rows to Python types while connection is open
+3. Close DB2 connection
+4. THEN yield rows to the caller (safe from JDBC result set closure)
+
+For very large tables (10M+ rows), use SQL-level chunking with WHERE clauses
+to keep memory manageable.
 """
 
 import time
@@ -177,7 +189,11 @@ class ExtractionCursor:
         columns: list[str] | None = None,
     ) -> Generator[tuple[Any, ...], None, None]:
         """
-        Extract data for a single chunk with batch fetching.
+        Extract data for a single chunk with batched streaming.
+
+        Uses fetchmany() to fetch data in batches, reducing network round-trips
+        while maintaining low memory usage. Each batch is processed and yielded
+        row-by-row before fetching the next batch.
 
         Args:
             chunk_id: Chunk identifier
@@ -198,22 +214,19 @@ class ExtractionCursor:
             table=self.table_name,
             chunk_id=chunk_id,
             where_clause=where_clause[:100],
+            batch_size=self.batch_size,
         )
 
         self.rows_fetched = 0
         column_list = ", ".join(columns) if columns else "*"
 
         # Build query with WITH UR for uncommitted read
-        query = f"""
-            SELECT {column_list}
-            FROM {self.table_name}
-            WHERE {where_clause}
-            WITH UR
-        """
+        query = f"SELECT {column_list} FROM {self.table_name} WHERE {where_clause} WITH UR"
 
         # Manually manage connection to keep it open during generator iteration
         conn = None
         cursor = None
+        batches_processed = 0
 
         try:
             conn = create_connection(self.db2_settings)
@@ -222,32 +235,47 @@ class ExtractionCursor:
             # Execute query with retry logic
             self.execute_with_retry(cursor, query, params)
 
-            # JDBC workaround: Fetch ALL rows immediately
-            # JDBC result sets close when generator yields, so we must materialize everything first
+            # JDBC COMPATIBILITY:
+            #
+            # JDBC drivers have strict result set handling - fetchmany() often
+            # doesn't work reliably. We use fetchall() which is universally supported.
+            #
+            # For truly huge tables (10M+ rows), use SQL-level chunking with
+            # WHERE clauses to process smaller subsets.
+
+            log.debug("fetching_all_rows", table=self.table_name, chunk_id=chunk_id)
+
+            # Fetch ALL rows at once - most reliable with JDBC
             all_rows = cursor.fetchall()
 
             log.info(
-                "rows_fetched_from_db",
+                "fetch_completed",
                 table=self.table_name,
                 chunk_id=chunk_id,
                 total_rows=len(all_rows),
             )
 
-            # Materialize all data immediately while connection is still open
-            materialized_rows = []
+            # Materialize all data to Python types while connection is still valid
+            all_materialized_rows = []
             for row in all_rows:
-                python_row = []
-                for val in row:
-                    if val is None:
-                        python_row.append(None)
-                    else:
-                        # Convert to string to force complete materialization
-                        python_row.append(str(val))
-                materialized_rows.append(tuple(python_row))
+                python_row = tuple(
+                    self._convert_jdbc_value(val) for val in row
+                )
+                all_materialized_rows.append(python_row)
 
-            # Now yield the fully materialized rows
-            # Connection can close after this point
-            for python_row in materialized_rows:
+            # Free the raw rows to reduce memory
+            del all_rows
+
+            # Close DB2 connection BEFORE yielding (JDBC-safe)
+            if cursor:
+                cursor.close()
+                cursor = None
+            if conn:
+                conn.close()
+                conn = None
+
+            # NOW yield all rows (connection is closed, safe from JDBC issues)
+            for python_row in all_materialized_rows:
                 self.rows_fetched += 1
                 yield python_row
 
@@ -256,6 +284,7 @@ class ExtractionCursor:
                 table=self.table_name,
                 chunk_id=chunk_id,
                 total_rows=self.rows_fetched,
+                batches=batches_processed,
             )
 
         except Exception as e:

@@ -55,6 +55,11 @@ class JDBCConnection:
 
     def close(self):
         if not self.closed:
+            # Commit any pending transaction before closing
+            try:
+                self.jdbc_conn.commit()
+            except Exception:
+                pass  # Ignore commit errors on close
             self.jdbc_conn.close()
             self.closed = True
 
@@ -82,8 +87,18 @@ class JDBCCursor:
         return [tuple(row) for row in results]
 
     def fetchall(self) -> list[tuple]:
-        results = self.jdbc_cursor.fetchall()
-        return [tuple(row) for row in results]
+        try:
+            results = self.jdbc_cursor.fetchall()
+            return [tuple(row) for row in results]
+        except Exception as e:
+            # Log detailed JDBC error information
+            error_str = str(e)
+            log.error(
+                "jdbc_fetchall_failed",
+                error=error_str,
+                cursor_description=str(self._description),
+            )
+            raise
 
     def close(self):
         self.jdbc_cursor.close()
@@ -411,6 +426,24 @@ def _create_jdbc_connection(
                 [settings.uid, settings.pwd],
                 jdbc_driver,
             )
+
+            # CRITICAL: Disable autocommit to prevent result set closure
+            # JDBC autocommit=True (default) closes result sets after each statement
+            try:
+                jdbc_conn.jconn.setAutoCommit(False)
+                log.debug("jdbc_autocommit_disabled")
+            except Exception as ac_err:
+                log.warning("jdbc_autocommit_setting_failed", error=str(ac_err))
+
+            # Verify connection is working with a simple query
+            try:
+                test_cursor = jdbc_conn.cursor()
+                test_cursor.execute("SELECT 1 FROM SYSIBM.SYSDUMMY1")
+                test_result = test_cursor.fetchone()
+                test_cursor.close()
+                log.debug("jdbc_connection_verified", test_result=str(test_result))
+            except Exception as verify_err:
+                log.warning("jdbc_connection_verify_failed", error=str(verify_err))
 
             log.info(
                 "db2_connection_success",
